@@ -65,13 +65,6 @@ passed is null, which makes the query one about the job of the caller, and leave
 refused - nothing else for the code to mean.
 """
 
-_ERROR_BAD_LENGTH = 24
-"""What a query refuses a buffer of the wrong size with, ahead of any question about the job.
-
-Only a mistake in this module can produce it: every length passed is the `ctypes.sizeof` of a structure
-declared here.
-"""
-
 _LIMIT_AFFINITY = 0x10
 """`JOB_OBJECT_LIMIT_AFFINITY`: the job restricts which cores its processes may run on."""
 
@@ -535,8 +528,8 @@ def _query(info_class: int, structure: type[_Structure]) -> tuple[_Structure | N
 
     Returns:
         The filled structure and zero. Where the call failed, `None` and the code it failed with:
-        `_ERROR_NO_JOB` for a process that is in no job, `_ERROR_BAD_LENGTH` for a structure declared wrong
-        here, and anything else for a job that would not answer.
+        `_ERROR_NO_JOB` for a process that is in no job, and anything else for a job that would not answer
+        or a structure declared wrong here.
     """
     buffer = structure()
 
