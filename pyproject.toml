@@ -134,7 +134,7 @@ e2e-tests = "uv run pytest tests/e2e"
 check-code = ["lint", "type-check", "unit-tests"]
 
 [tool.poe.tasks.install-dev]
-shell = "uv sync --group dev --locked && uv run pre-commit install"
+shell = "uv sync --group dev --locked && if git rev-parse --git-dir > /dev/null 2>&1; then uv run pre-commit install; fi"
 
 [tool.poe.tasks.lint]
 shell = "uv run ruff format --check && uv run ruff check"
