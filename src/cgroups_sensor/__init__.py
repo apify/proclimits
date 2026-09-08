@@ -1,12 +1,8 @@
 from ._sensor import (
     CpuLoad,
     Description,
-    Interface,
     MemoryBudget,
-    Notice,
-    NoticeCode,
     Snapshot,
-    Source,
     clear_cache,
     describe,
     get_cpu_limit,
@@ -18,14 +14,11 @@ from ._sensor import (
     get_memory_budget,
     snapshot,
 )
+from ._types import Interface, Notice, NoticeCode, Source
 
 
 def __getattr__(name: str) -> str:
-    """Read `__version__` from the installed metadata, the first time anything asks for it.
-
-    Reading it costs more than everything else this package does at import time, and a consumer that only
-    wants the limits never asks. `importlib.metadata` is therefore imported here rather than above.
-    """
+    """Read `__version__` from the installed metadata, only where something asks for it."""
     if name != '__version__':
         raise AttributeError(f'module {__name__!r} has no attribute {name!r}')
 

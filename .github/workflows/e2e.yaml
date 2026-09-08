@@ -10,15 +10,15 @@ on:
 permissions:
   contents: read
 
-# One run per branch. A superseded push is cancelled, except on main, where every commit is checked. These
-# lanes boot virtual machines, so a queue of stale runs is expensive.
+# One run per branch. A superseded push is cancelled, except on main, where every commit is checked. The
+# guest lanes boot virtual machines, so a queue of stale runs is expensive.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
-  # The interpreter is a real axis only for what the probe runs on: the container tests below bring their own
-  # interpreters with uv, and running them once per version would repeat identical work five times.
+  # The interpreter is a real axis only for what the probe runs on: the container tests name the version
+  # themselves, and running the lane once per version would repeat identical work five times.
   machine:
     name: machine (python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
@@ -116,6 +116,55 @@ jobs:
       # rather than through systemd. Slices mean nothing to it then; the fedora guest covers that shape.
       - name: Run the podman tests
         run: uv run pytest tests/e2e/test_podman.py -m 'not systemd_slices'
+
+  windows:
+    name: windows (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      UV_PYTHON: '3.13'
+      E2E_PLATFORM: win32
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            image: mcr.microsoft.com/windows/nanoserver:ltsc2022
+          - os: windows-2025
+            image: mcr.microsoft.com/windows/nanoserver:ltsc2025
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up uv package manager
+        uses: astral-sh/setup-uv@v10.0.1
+
+      - name: Install dependencies
+        run: uv run poe install-dev
+
+      # The tests build the jobs they read, so this step needs no container runtime and no privileges.
+      - name: Run the job object tests
+        run: uv run pytest tests/e2e/test_windows.py
+
+      # The Docker service is sometimes stopped on a Windows runner, and every container then fails on a
+      # missing `//./pipe/docker_engine`. Starting it is the workaround the runner maintainers pinned in
+      # https://github.com/actions/runner-images/issues/13729. `docker info` afterwards pins a failure here
+      # rather than on the tests.
+      - name: Start the Docker service
+        run: |
+          if ((Get-Service docker).Status -ne 'Running') { Start-Service docker }
+          $deadline = (Get-Date).AddMinutes(3)
+          do {
+            docker info *> $null
+            if ($LASTEXITCODE -eq 0) { break }
+            Start-Sleep -Seconds 2
+          } while ((Get-Date) -lt $deadline)
+          docker info --format 'daemon up: {{.OSType}} containers, server {{.ServerVersion}}'
+
+      - name: Run the container tests
+        env:
+          E2E_WINDOWS_IMAGE: ${{ matrix.image }}
+        run: uv run pytest tests/e2e/test_windows_containers.py
 
   kubernetes:
     name: kubernetes

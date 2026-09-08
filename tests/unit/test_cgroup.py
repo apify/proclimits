@@ -66,7 +66,7 @@ def test_read_hierarchies_v1(fake_cgroup: Callable[..., Path]) -> None:
 
 
 def test_read_hierarchies_bad_lines(fake_cgroup: Callable[..., Path]) -> None:
-    """Skips the lines it cannot parse, which a table of every filesystem on the machine is full of."""
+    """Keeps reading the mount table past the lines that are not mount entries."""
     mountinfo = (
         'not a mount line\n'
         '24 30 0:21 / /sys rw - sysfs sysfs rw\n'
@@ -174,9 +174,11 @@ def test_read_hierarchies_no_unified_when_no_mount_covers(fake_cgroup: Callable[
     assert hierarchies.unified is None
     assert cgroup.read_memory() == cgroup.RawMemory(
         limit=None,
-        working_set=None,
-        limit_directory=None,
-        unreadable_directory=None,
+        used=None,
+        available=None,
+        limit_level=None,
+        unreadable_level=None,
+        usage_unreadable_level=None,
     )
 
 
@@ -198,9 +200,11 @@ def test_read_hierarchies_v1_answers_when_no_cgroup2_mount_covers(fake_cgroup: C
 
     assert cgroup.read_memory() == cgroup.RawMemory(
         limit=536870912,
-        working_set=600,
-        limit_directory=root / 'memory',
-        unreadable_directory=None,
+        used=600,
+        available=536870312,
+        limit_level=str(root / 'memory'),
+        unreadable_level=None,
+        usage_unreadable_level=None,
     )
 
 
@@ -220,7 +224,7 @@ def test_unescape(escaped: str, expected: str) -> None:
 
 
 def test_read_hierarchies_escaped_paths(fake_cgroup: Callable[..., Path]) -> None:
-    """Decodes both path fields, which `/proc/self/cgroup` spells unescaped and so cannot be compared against."""
+    """Decodes both path fields: the mount point is opened, and the root is compared against `/proc/self/cgroup`."""
     mountinfo = '25 30 0:22 /docker\\040abc {root}/mnt\\040point rw shared:4 - cgroup2 cgroup2 rw'
     root = fake_cgroup(
         mountinfo=mountinfo,
@@ -396,9 +400,41 @@ def test_read_memory_tightest_level(fake_cgroup: Callable[..., Path]) -> None:
     # 900 bytes can still be allocated before the container's own limit, and 2000 before the node's.
     assert cgroup.read_memory() == cgroup.RawMemory(
         limit=1000,
-        working_set=100,
-        limit_directory=root / 'kubepods' / 'pod' / 'container',
-        unreadable_directory=None,
+        used=100,
+        available=900,
+        limit_level=str(root / 'kubepods' / 'pod' / 'container'),
+        unreadable_level=None,
+        usage_unreadable_level=None,
+    )
+
+
+def test_read_memory_when_the_tightest_limit_is_not_the_closest(fake_cgroup: Callable[..., Path]) -> None:
+    """Reports the room at whichever level is closest to its own limit, against the tightest limit there is."""
+    root = fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/pod/container'),
+        files={
+            # The tighter limit, and far from it.
+            'pod/container/memory.max': '500\n',
+            'pod/container/memory.current': '110\n',
+            'pod/container/memory.stat': 'inactive_file 10\n',
+            # A looser limit that the sibling containers have nearly used up.
+            'pod/memory.max': '1000\n',
+            'pod/memory.current': '960\n',
+            'pod/memory.stat': 'inactive_file 10\n',
+        },
+    )
+
+    # 50 bytes left at the pod against 400 at this container, so 50 is what can still be allocated. The pair
+    # is expressed against the tightest limit, which makes `used` 450 - the charge of neither level, one
+    # holding 100 and the other 950.
+    assert cgroup.read_memory() == cgroup.RawMemory(
+        limit=500,
+        used=450,
+        available=50,
+        limit_level=str(root / 'pod' / 'container'),
+        unreadable_level=None,
+        usage_unreadable_level=None,
     )
 
 
@@ -422,9 +458,11 @@ def test_read_memory_tighter_ancestor(fake_cgroup: Callable[..., Path]) -> None:
     # 50 bytes left at the node against 750 at the pod's own limit, so the pod's limit never binds.
     assert cgroup.read_memory() == cgroup.RawMemory(
         limit=500,
-        working_set=450,
-        limit_directory=root / 'kubepods',
-        unreadable_directory=None,
+        used=450,
+        available=50,
+        limit_level=str(root / 'kubepods'),
+        unreadable_level=None,
+        usage_unreadable_level=None,
     )
 
 
@@ -448,9 +486,11 @@ def test_read_memory_smallest_distance(fake_cgroup: Callable[..., Path]) -> None
     # The tighter limit is the pod's, the tighter distance the node's: 20 bytes left, not 80.
     assert cgroup.read_memory() == cgroup.RawMemory(
         limit=100,
-        working_set=80,
-        limit_directory=root / 'kubepods' / 'pod',
-        unreadable_directory=None,
+        used=80,
+        available=20,
+        limit_level=str(root / 'kubepods' / 'pod'),
+        unreadable_level=None,
+        usage_unreadable_level=None,
     )
 
 
@@ -472,9 +512,11 @@ def test_read_memory_partial_level(fake_cgroup: Callable[..., Path]) -> None:
 
     assert cgroup.read_memory() == cgroup.RawMemory(
         limit=1000,
-        working_set=None,
-        limit_directory=root / 'kubepods' / 'pod' / 'container',
-        unreadable_directory=None,
+        used=None,
+        available=None,
+        limit_level=str(root / 'kubepods' / 'pod' / 'container'),
+        unreadable_level=None,
+        usage_unreadable_level=str(root / 'kubepods' / 'pod' / 'container'),
     )
 
 
@@ -503,20 +545,20 @@ def test_read_memory_partial_level(fake_cgroup: Callable[..., Path]) -> None:
         ),
     ],
 )
-def test_read_memory_working_set(
+def test_read_memory_used(
     fake_cgroup: Callable[..., Path],
     mountinfo: str,
     self_cgroup: str,
     files: dict[str, str],
 ) -> None:
-    """Subtracts the page cache the kernel drops on demand, which would not predict a kill."""
+    """Subtracts the inactive file cache, which the kernel drops on demand and which would not predict a kill."""
     fake_cgroup(mountinfo=mountinfo, self_cgroup=self_cgroup, files=files)
 
-    assert cgroup.read_memory().working_set == 600
+    assert cgroup.read_memory().used == 600
 
 
 def test_read_memory_usage_above_the_limit(fake_cgroup: Callable[..., Path]) -> None:
-    """Clamps the working set to the limit, because sitting above it while the kernel reclaims is not actionable."""
+    """Clamps what is in use to the limit, because sitting above it while the kernel reclaims is not actionable."""
     root = fake_cgroup(
         mountinfo=V2_MOUNTINFO,
         self_cgroup=V2_SELF_CGROUP.format(path='/'),
@@ -525,9 +567,11 @@ def test_read_memory_usage_above_the_limit(fake_cgroup: Callable[..., Path]) -> 
 
     assert cgroup.read_memory() == cgroup.RawMemory(
         limit=1000,
-        working_set=1000,
-        limit_directory=root,
-        unreadable_directory=None,
+        used=1000,
+        available=0,
+        limit_level=str(root),
+        unreadable_level=None,
+        usage_unreadable_level=None,
     )
 
 
@@ -540,21 +584,27 @@ def test_read_memory_ancestor_without_usage_files(fake_cgroup: Callable[..., Pat
             'pod/container/memory.max': '1000\n',
             'pod/container/memory.current': '100\n',
             'pod/container/memory.stat': 'inactive_file 0\n',
-            # The tightest limit sits on the ancestor, which carries no `memory.current` of its own.
+            # The tightest limit sits on the ancestor, whose usage will not read.
             'pod/memory.max': '500\n',
+            'pod/memory.stat': 'inactive_file 0\n',
         },
     )
+    # A directory in place of the file, as for a limit that cannot be opened. A level holding a limit holds a
+    # usage file beside it, so the figure goes missing by failing to read rather than by being absent.
+    (root / 'pod' / 'memory.current').mkdir()
 
     # The tightest limit is the ancestor's, and nothing says how close it is to it.
     assert cgroup.read_memory() == cgroup.RawMemory(
         limit=500,
-        working_set=None,
-        limit_directory=root / 'pod',
-        unreadable_directory=None,
+        used=None,
+        available=None,
+        limit_level=str(root / 'pod'),
+        unreadable_level=None,
+        usage_unreadable_level=str(root / 'pod'),
     )
 
 
-def test_read_memory_no_working_set(fake_cgroup: Callable[..., Path]) -> None:
+def test_read_memory_no_used(fake_cgroup: Callable[..., Path]) -> None:
     """Reports a limit that no usage can be paired with as-is, leaving the judgement to the sensor layer."""
     root = fake_cgroup(
         mountinfo=V2_MOUNTINFO,
@@ -564,9 +614,11 @@ def test_read_memory_no_working_set(fake_cgroup: Callable[..., Path]) -> None:
 
     assert cgroup.read_memory() == cgroup.RawMemory(
         limit=536870912,
-        working_set=None,
-        limit_directory=root,
-        unreadable_directory=None,
+        used=None,
+        available=None,
+        limit_level=str(root),
+        unreadable_level=None,
+        usage_unreadable_level=str(root),
     )
 
 
@@ -586,9 +638,11 @@ def test_read_memory_missing_files(fake_cgroup: Callable[..., Path]) -> None:
 
     assert cgroup.read_memory() == cgroup.RawMemory(
         limit=268435456,
-        working_set=600,
-        limit_directory=root / 'pod',
-        unreadable_directory=None,
+        used=600,
+        available=268434856,
+        limit_level=str(root / 'pod'),
+        unreadable_level=None,
+        usage_unreadable_level=None,
     )
 
 
@@ -696,7 +750,7 @@ def test_read_cpu_quota(
             V2_SELF_CGROUP.format(path='/'),
             {'cpuset.cpus.effective': '\n'},
             None,
-            id='inherited from the parent',
+            id='an empty set restricts nothing',
         ),
         pytest.param(
             V1_MOUNTINFO,
@@ -730,7 +784,7 @@ def test_read_cpu_set_size_unparsable_entry(fake_cgroup: Callable[..., Path]) ->
         files={'cpuset.cpus.effective': '0-1,nonsense\n'},
     )
 
-    assert cgroup.read_cpu().unreadable_directory == root
+    assert cgroup.read_cpu().unreadable_level == str(root)
 
 
 @pytest.mark.parametrize(
@@ -788,12 +842,13 @@ def test_read_cpu_set_size_unreadable_file(fake_cgroup: Callable[..., Path]) -> 
         self_cgroup=V2_SELF_CGROUP.format(path='/'),
         files={'cpuset.cpus.effective': '0-1\n'},
     )
-    # A directory in place of the file fails the read the way a cgroup removed between locating and reading
-    # it does, and without the race.
+    # A directory in place of the file, so the file is there and the read fails.
     (root / 'cpuset.cpus.effective').unlink()
     (root / 'cpuset.cpus.effective').mkdir()
 
-    assert cgroup.read_cpu() == cgroup.RawCpu(quota=None, cpu_set=None, unreadable_directory=root)
+    assert cgroup.read_cpu() == cgroup.RawCpu(
+        quota=None, cpu_set=None, unreadable_level=str(root), unconvertible_level=None
+    )
 
 
 def test_locate_cpu_usage_skips_a_controller_less_unified_hierarchy(fake_cgroup: Callable[..., Path]) -> None:
@@ -877,8 +932,8 @@ def test_cpu_usage_dir_rejects_a_group_of_the_same_name(fake_cgroup: Callable[..
 
     assert quota is not None
     assert quota.cores == 2.0
-    assert quota.limit_directory == root / 'cpu' / 'limited'
-    assert quota.usage_directory is None
+    assert quota.limit_level == str(root / 'cpu' / 'limited')
+    assert quota.usage_level is None
 
 
 def test_read_memory_unreadable_limit(fake_cgroup: Callable[..., Path]) -> None:
@@ -898,14 +953,16 @@ def test_read_memory_unreadable_limit(fake_cgroup: Callable[..., Path]) -> None:
 
     assert cgroup.read_memory() == cgroup.RawMemory(
         limit=None,
-        working_set=None,
-        limit_directory=None,
-        unreadable_directory=root / 'pod' / 'container',
+        used=None,
+        available=None,
+        limit_level=None,
+        unreadable_level=str(root / 'pod' / 'container'),
+        usage_unreadable_level=None,
     )
 
 
 def test_read_memory_looser_level_without_usage(fake_cgroup: Callable[..., Path]) -> None:
-    """Drops the working set for a missing usage on a looser level, which can still be the closest to its limit."""
+    """Drops the working set for an unread usage on a looser level, which can still be the closest to its limit."""
     root = fake_cgroup(
         mountinfo=V2_MOUNTINFO,
         self_cgroup=V2_SELF_CGROUP.format(path='/pod/container'),
@@ -916,14 +973,18 @@ def test_read_memory_looser_level_without_usage(fake_cgroup: Callable[..., Path]
             'pod/container/memory.stat': 'inactive_file 0\n',
             # Looser, and silent about its own usage.
             'pod/memory.max': '1000\n',
+            'pod/memory.stat': 'inactive_file 0\n',
         },
     )
+    (root / 'pod' / 'memory.current').mkdir()
 
     assert cgroup.read_memory() == cgroup.RawMemory(
         limit=500,
-        working_set=None,
-        limit_directory=root / 'pod' / 'container',
-        unreadable_directory=None,
+        used=None,
+        available=None,
+        limit_level=str(root / 'pod' / 'container'),
+        unreadable_level=None,
+        usage_unreadable_level=str(root / 'pod'),
     )
 
 
@@ -939,10 +1000,10 @@ def test_read_memory_limit_file_cannot_be_opened(fake_cgroup: Callable[..., Path
             'pod/container/memory.current': '100\n',
         },
     )
-    # A directory in place of the file, which a denied delegation and a racing runtime both amount to.
+    # A directory in place of the file, so the file is there and the read fails.
     (root / 'pod' / 'container' / 'memory.max').mkdir()
 
-    assert cgroup.read_memory().unreadable_directory == root / 'pod' / 'container'
+    assert cgroup.read_memory().unreadable_level == str(root / 'pod' / 'container')
 
 
 def test_read_memory_negative_limit(fake_cgroup: Callable[..., Path]) -> None:
@@ -958,7 +1019,7 @@ def test_read_memory_negative_limit(fake_cgroup: Callable[..., Path]) -> None:
         },
     )
 
-    assert cgroup.read_memory().unreadable_directory == root / 'pod' / 'container'
+    assert cgroup.read_memory().unreadable_level == str(root / 'pod' / 'container')
 
 
 def test_read_cpu_quota_unreadable_level(fake_cgroup: Callable[..., Path]) -> None:
@@ -977,7 +1038,8 @@ def test_read_cpu_quota_unreadable_level(fake_cgroup: Callable[..., Path]) -> No
     assert cgroup.read_cpu() == cgroup.RawCpu(
         quota=None,
         cpu_set=None,
-        unreadable_directory=root / 'pod' / 'container',
+        unreadable_level=str(root / 'pod' / 'container'),
+        unconvertible_level=None,
     )
 
 
@@ -997,7 +1059,7 @@ def test_read_cpu_set_size_inherited_under_v1(fake_cgroup: Callable[..., Path]) 
 
     assert cpu_set is not None
     assert cpu_set.cores == 2
-    assert cpu_set.limit_directory == root / 'cpuset' / 'child'
+    assert cpu_set.limit_level == str(root / 'cpuset' / 'child')
 
 
 def test_read_cpu_set_size_without_a_counter_of_its_own(fake_cgroup: Callable[..., Path]) -> None:
@@ -1012,7 +1074,7 @@ def test_read_cpu_set_size_without_a_counter_of_its_own(fake_cgroup: Callable[..
 
     assert cpu_set is not None
     assert cpu_set.cores == 2
-    assert cpu_set.usage_directory is None
+    assert cpu_set.usage_level is None
 
 
 def test_read_cpu_set_size_from_an_ancestor(fake_cgroup: Callable[..., Path]) -> None:
@@ -1033,8 +1095,8 @@ def test_read_cpu_set_size_from_an_ancestor(fake_cgroup: Callable[..., Path]) ->
     assert cpu_set.cores == 2
     # The set restricts the pod, so that is the level it is read at and the one whose time it is measured
     # against.
-    assert cpu_set.limit_directory == root / 'pod'
-    assert cpu_set.usage_directory == root / 'pod'
+    assert cpu_set.limit_level == str(root / 'pod')
+    assert cpu_set.usage_level == str(root / 'pod')
 
 
 def test_read_cpu_set_size_without_any_accounting_hierarchy(fake_cgroup: Callable[..., Path]) -> None:
@@ -1049,7 +1111,7 @@ def test_read_cpu_set_size_without_any_accounting_hierarchy(fake_cgroup: Callabl
 
     assert cpu_set is not None
     assert cpu_set.cores == 2
-    assert cpu_set.usage_directory is None
+    assert cpu_set.usage_level is None
 
 
 def test_read_cpu_set_size_across_split_hierarchies(fake_cgroup: Callable[..., Path]) -> None:
@@ -1066,8 +1128,8 @@ def test_read_cpu_set_size_across_split_hierarchies(fake_cgroup: Callable[..., P
     cpu_set = cgroup.read_cpu_set_size()
 
     assert cpu_set is not None
-    assert cpu_set.limit_directory == root / 'cpuset' / 'limited'
-    assert cpu_set.usage_directory == root / 'cpuacct' / 'limited'
+    assert cpu_set.limit_level == str(root / 'cpuset' / 'limited')
+    assert cpu_set.usage_level == str(root / 'cpuacct' / 'limited')
 
 
 def test_locate_controllers_hybrid(fake_cgroup: Callable[..., Path]) -> None:
@@ -1088,9 +1150,11 @@ def test_locate_controllers_hybrid(fake_cgroup: Callable[..., Path]) -> None:
     assert memory.is_v2 is False
     assert cgroup.read_memory() == cgroup.RawMemory(
         limit=536870912,
-        working_set=600,
-        limit_directory=root / 'memory',
-        unreadable_directory=None,
+        used=600,
+        available=536870312,
+        limit_level=str(root / 'memory'),
+        unreadable_level=None,
+        usage_unreadable_level=None,
     )
 
 
@@ -1099,9 +1163,11 @@ def test_no_cgroups() -> None:
     """Reports nothing on a system that has no cgroups."""
     assert cgroup.read_memory() == cgroup.RawMemory(
         limit=None,
-        working_set=None,
-        limit_directory=None,
-        unreadable_directory=None,
+        used=None,
+        available=None,
+        limit_level=None,
+        unreadable_level=None,
+        usage_unreadable_level=None,
     )
     assert cgroup.read_cpu_quota() is None
     assert cgroup.read_cpu_set_size() is None
@@ -1113,7 +1179,7 @@ def raise_permission_error(_self: Path) -> bool:
     raise PermissionError(13, 'Permission denied')
 
 
-def test_exists_on_an_unreadable_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_exists_on_an_unreadable_level(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Reports a path as missing when the lookup is denied. Only Python 3.14 does that on its own."""
     monkeypatch.setattr(Path, 'exists', raise_permission_error)
 
@@ -1135,9 +1201,11 @@ def test_locate_controllers_with_unreadable_directories(
     assert cgroup.locate_controllers().memory is None
     assert cgroup.read_memory() == cgroup.RawMemory(
         limit=None,
-        working_set=None,
-        limit_directory=None,
-        unreadable_directory=None,
+        used=None,
+        available=None,
+        limit_level=None,
+        unreadable_level=None,
+        usage_unreadable_level=None,
     )
 
 
@@ -1169,8 +1237,8 @@ def test_read_cpu_quota_tightest_level(fake_cgroup: Callable[..., Path]) -> None
     # The quota binds on the pod, so a rate has to be measured there rather than in the container.
     assert cgroup.read_cpu_quota() == cgroup.RawCpuQuota(
         cores=1.5,
-        limit_directory=root / 'pod',
-        usage_directory=root / 'pod',
+        limit_level=str(root / 'pod'),
+        usage_level=str(root / 'pod'),
     )
 
 
@@ -1189,8 +1257,8 @@ def test_read_cpu_quota_on_the_own_group(fake_cgroup: Callable[..., Path]) -> No
 
     assert cgroup.read_cpu_quota() == cgroup.RawCpuQuota(
         cores=1.5,
-        limit_directory=root / 'pod' / 'container',
-        usage_directory=root / 'pod' / 'container',
+        limit_level=str(root / 'pod' / 'container'),
+        usage_level=str(root / 'pod' / 'container'),
     )
 
 
@@ -1205,7 +1273,23 @@ def test_read_cpu_usage_at_a_named_level(fake_cgroup: Callable[..., Path]) -> No
         },
     )
 
-    assert cgroup.read_cpu_usage(root / 'pod') == 90.0
+    assert cgroup.read_cpu_usage(str(root / 'pod')) == 90.0
+
+
+def test_read_cpu_usage_at_a_level_outside_the_chain(fake_cgroup: Callable[..., Path]) -> None:
+    """Answers nothing for a level this mechanism does not count, whatever a counter there says."""
+    root = fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/pod/container'),
+        files={
+            'pod/container/cpu.stat': 'usage_usec 2500000\n',
+            'elsewhere/cpu.stat': 'usage_usec 123456789\n',
+        },
+    )
+
+    # A readable counter, and the level belongs to somebody else: a rate taken from it would divide the time
+    # of one scope by the limit of another.
+    assert cgroup.read_cpu_usage(str(root / 'elsewhere')) is None
 
 
 def test_read_cpu_set_size_reads_the_closest_level(fake_cgroup: Callable[..., Path]) -> None:
@@ -1226,7 +1310,7 @@ def test_read_cpu_set_size_reads_the_closest_level(fake_cgroup: Callable[..., Pa
 
     assert cpu_set is not None
     assert cpu_set.cores == 2
-    assert cpu_set.usage_directory == root / 'pod' / 'container'
+    assert cpu_set.usage_level == str(root / 'pod' / 'container')
 
 
 def test_read_cpu_usage_reads_the_closest_level(fake_cgroup: Callable[..., Path]) -> None:
@@ -1261,14 +1345,18 @@ def test_read_memory_limit_of_zero(fake_cgroup: Callable[..., Path]) -> None:
 
     assert cgroup.read_memory() == cgroup.RawMemory(
         limit=0,
-        working_set=0,
-        limit_directory=root / 'pod' / 'container',
-        unreadable_directory=None,
+        used=0,
+        available=0,
+        limit_level=str(root / 'pod' / 'container'),
+        unreadable_level=None,
+        usage_unreadable_level=None,
     )
 
 
 def test_read_memory_usage_below_the_cache(fake_cgroup: Callable[..., Path]) -> None:
-    """Floors the charged memory at zero when the reclaimable cache reads larger than the usage."""
+    """Floors the charged memory at zero where the cache reads larger than the usage it is part of."""
+    # The two files are read a moment apart, and only a cgroup that grew between the reads can spell them
+    # this way round.
     root = fake_cgroup(
         mountinfo=V2_MOUNTINFO,
         self_cgroup=V2_SELF_CGROUP.format(path='/'),
@@ -1280,9 +1368,11 @@ def test_read_memory_usage_below_the_cache(fake_cgroup: Callable[..., Path]) -> 
     assert cgroup._read_working_set(controller, root) == 0
     assert cgroup.read_memory() == cgroup.RawMemory(
         limit=1000,
-        working_set=0,
-        limit_directory=root,
-        unreadable_directory=None,
+        used=0,
+        available=1000,
+        limit_level=str(root),
+        unreadable_level=None,
+        usage_unreadable_level=None,
     )
 
 
@@ -1298,7 +1388,7 @@ def test_read_cpu_quota_v1_zero_period(fake_cgroup: Callable[..., Path]) -> None
         },
     )
 
-    assert cgroup.read_cpu().unreadable_directory == root / 'cpu,cpuacct'
+    assert cgroup.read_cpu().unreadable_level == str(root / 'cpu,cpuacct')
 
 
 def test_read_hierarchies_first_v1_mount_wins(fake_cgroup: Callable[..., Path]) -> None:
@@ -1342,9 +1432,11 @@ def test_read_hierarchies_skips_a_foreign_v1_mount(fake_cgroup: Callable[..., Pa
     assert hierarchies.v1['memory'].mount_point == root / 'ours'
     assert cgroup.read_memory() == cgroup.RawMemory(
         limit=2000,
-        working_set=100,
-        limit_directory=root / 'ours' / 'mine',
-        unreadable_directory=None,
+        used=100,
+        available=1900,
+        limit_level=str(root / 'ours' / 'mine'),
+        unreadable_level=None,
+        usage_unreadable_level=None,
     )
 
 
@@ -1362,9 +1454,11 @@ def test_read_memory_v1_uses_the_hierarchical_key(fake_cgroup: Callable[..., Pat
 
     assert cgroup.read_memory() == cgroup.RawMemory(
         limit=1000,
-        working_set=500,
-        limit_directory=root / 'memory',
-        unreadable_directory=None,
+        used=500,
+        available=500,
+        limit_level=str(root / 'memory'),
+        unreadable_level=None,
+        usage_unreadable_level=None,
     )
 
 
@@ -1387,10 +1481,10 @@ def test_read_cpu_quota_across_split_hierarchies(fake_cgroup: Callable[..., Path
 
     assert quota is not None
     assert quota.cores == 0.5
-    assert quota.limit_directory == root / 'cpu' / 'slice'
+    assert quota.limit_level == str(root / 'cpu' / 'slice')
     # The counter of that level lives under the other mount point.
-    assert quota.usage_directory == root / 'cpuacct' / 'slice'
-    assert cgroup.read_cpu_usage(quota.usage_directory) == 7.0
+    assert quota.usage_level == str(root / 'cpuacct' / 'slice')
+    assert cgroup.read_cpu_usage(quota.usage_level) == 7.0
 
 
 def test_read_cpu_quota_without_accounting(fake_cgroup: Callable[..., Path]) -> None:
@@ -1410,7 +1504,7 @@ def test_read_cpu_quota_without_accounting(fake_cgroup: Callable[..., Path]) -> 
 
     assert quota is not None
     assert quota.cores == 0.5
-    assert quota.usage_directory is None
+    assert quota.usage_level is None
 
 
 @pytest.mark.parametrize(
@@ -1429,7 +1523,7 @@ def test_read_cpu_quota_v2_degenerate(fake_cgroup: Callable[..., Path], cpu_max:
         files={'cpu.max': cpu_max, 'cpu.stat': 'usage_usec 0\n'},
     )
 
-    assert cgroup.read_cpu().unreadable_directory == root
+    assert cgroup.read_cpu().unreadable_level == str(root)
 
 
 def test_read_cpu_quota_appearing_after_discovery(fake_cgroup: Callable[..., Path]) -> None:
@@ -1454,4 +1548,4 @@ def test_read_cpu_quota_appearing_after_discovery(fake_cgroup: Callable[..., Pat
 
     assert quota is not None
     assert quota.cores == 0.5
-    assert quota.limit_directory == root / 'slice' / 'own'
+    assert quota.limit_level == str(root / 'slice' / 'own')

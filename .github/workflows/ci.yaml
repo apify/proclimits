@@ -35,5 +35,5 @@ jobs:
     uses: apify/workflows/.github/workflows/python_unit_tests.yaml@main
     with:
       python_versions: '["3.10", "3.11", "3.12", "3.13", "3.14"]'
-      operating_systems: '["ubuntu-latest"]'
+      operating_systems: '["ubuntu-latest", "windows-latest"]'
       run_tests_command: uv run poe unit-tests

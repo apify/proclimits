@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from itertools import count
 from typing import TYPE_CHECKING
 
@@ -18,6 +19,20 @@ from .harness import (
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
+
+
+def pytest_sessionstart(session: pytest.Session) -> None:
+    """Refuse a run whose lane declared one platform and got another.
+
+    The platform guards in this suite skip rather than fail, which is right for a developer running the whole
+    thing on one machine. It is wrong for a lane: skipping every test leaves pytest exiting zero, so a lane
+    pointed at the wrong `runs-on` would be green having checked nothing.
+    """
+    del session
+
+    wanted = os.environ.get('E2E_PLATFORM')
+    if wanted and wanted != sys.platform:
+        raise pytest.UsageError(f'this lane declared E2E_PLATFORM={wanted} and is running on {sys.platform}')
 
 
 @pytest.fixture(scope='session')

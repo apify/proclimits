@@ -42,8 +42,8 @@ def test_rootless_memory_limit() -> None:
 
     check_invariants(reading)
     assert reading.memory_limit == MEMORY_LIMIT
-    assert reading.working_set is not None
-    assert reading.working_set < reading.memory_limit
+    assert reading.used is not None
+    assert reading.used < reading.memory_limit
     assert reading.cpu_limit is None
 
 

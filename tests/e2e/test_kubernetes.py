@@ -49,7 +49,7 @@ def kubectl(*args: str, check: bool = True) -> str:
 
 @pytest.fixture(scope='session')
 def _cluster() -> Iterator[None]:
-    """Bring up a kind cluster carrying the probe image, and take it down afterwards."""
+    """Bring up a kind cluster carrying the probe image where none is running, and take that one down afterwards."""
     existing = subprocess.run(
         ['kind', 'get', 'clusters'],
         capture_output=True,
@@ -79,7 +79,7 @@ def _cluster() -> Iterator[None]:
     )
 
     # The package and the probe travel as config maps, so no image has to be built. The files go in one by
-    # one, or a stray `__pycache__` travels with them.
+    # one, so only the Python sources travel.
     sources = sorted((SRC_DIR / 'cgroups_sensor').glob('*.py'))
     kubectl('delete', 'configmap', SRC_MAP, PROBE_MAP, '--ignore-not-found')
     kubectl('create', 'configmap', SRC_MAP, *[f'--from-file={path}' for path in sources])

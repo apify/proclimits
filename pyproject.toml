@@ -5,7 +5,7 @@ build-backend = "uv_build"
 [project]
 name = "cgroups-sensor"
 version = "0.1.0"
-description = "Resource limits that actually apply to the running process, read from cgroups"
+description = "Resource limits that actually apply to the running process, from cgroups or Windows job objects"
 authors = [
     { name = "Apify Technologies s.r.o.", email = "support@apify.com" },
     { name = "Max Bohomolov"},
@@ -19,6 +19,7 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -36,6 +37,7 @@ keywords = [
     "kubernetes",
     "limits",
     "memory",
+    "windows",
 ]
 dependencies = []
 
@@ -49,9 +51,7 @@ dev = [
     "poethepoet<1.0.0",
     "pytest<10.0.0",
     "ruff~=0.16.0",
-    # Pre-1.0 and released often. Bounded so that a nightly cannot change what CI enforces on its own; the
-    # lockfile pins the exact build.
-    "ty>=0.0.72,<0.1.0",
+    "ty>=0.0.77,<0.1.0",
 ]
 
 [tool.ruff]
@@ -83,6 +83,7 @@ indent-style = "space"
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = [
+    "ANN401",  # Dynamically typed expressions are disallowed
     "D",       # Docstring style is relaxed in tests
     "PLR2004", # Magic value used in comparison
     "S101",    # Use of assert detected
@@ -91,6 +92,7 @@ indent-style = "space"
     "SLF001",  # Private member accessed
     "T20",     # The e2e probe prints its result, that is its whole contract
 ]
+"tests/e2e/scripts/*.py" = ["INP001"]
 
 [tool.ruff.lint.flake8-quotes]
 docstring-quotes = "double"
@@ -113,6 +115,7 @@ verbosity_assertions = 2
 
 [tool.ty.environment]
 python-version = "3.10"
+python-platform = "all"
 
 [tool.ty.src]
 include = ["src", "tests"]
@@ -123,14 +126,10 @@ unused-ignore-comment = "error"
 # Run tasks with: uv run poe <task>
 [tool.poe.tasks]
 clean = "rm -rf .pytest_cache .ruff_cache build dist"
-# `--locked` so a lock that no longer matches `pyproject.toml` fails here rather than resolving anew, which
-# is what makes a guest run and a CI run install the same versions.
 install-dev = "uv sync --group dev --locked"
 build = "uv build --verbose"
 type-check = "uv run ty check"
 unit-tests = "uv run pytest tests/unit"
-# Both name a whole suite. Anything passed to them is appended, so a subset is `uv run pytest <path>` instead:
-# a path given here would be collected next to the directory rather than in place of it.
 e2e-tests = "uv run pytest tests/e2e"
 check-code = ["lint", "type-check", "unit-tests"]
 

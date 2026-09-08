@@ -35,7 +35,7 @@ def test_unrestricted() -> None:
 
 @pytest.mark.parametrize('python_version', PYTHON_VERSIONS)
 def test_python_versions(python_version: str) -> None:
-    """Reads the same machine facts on every interpreter, including 3.13 where `os.cpu_count()` gained an override."""
+    """Reads the same machine facts on every supported interpreter."""
     reading = probe_here(python_version=python_version)
 
     check_invariants(reading)
@@ -50,8 +50,8 @@ def test_memory_limit(systemd_scope: Callable[..., list[str]]) -> None:
 
     check_invariants(reading)
     assert reading.memory_limit == MEMORY_LIMIT
-    assert reading.working_set is not None
-    assert reading.working_set < reading.memory_limit
+    assert reading.used is not None
+    assert reading.used < reading.memory_limit
     # The machine can carry unrelated notices, e.g. about a CPU set covering every core.
     assert not notices_about(reading, 'memory')
 
@@ -91,7 +91,7 @@ def test_cpu_quota_above_the_machine(systemd_scope: Callable[..., list[str]]) ->
 
 
 def test_every_axis_at_once(systemd_scope: Callable[..., list[str]]) -> None:
-    """Reads all three limits at once. The tighter of the two CPU axes wins."""
+    """Reads every limit this hierarchy allows at once. Where both CPU axes are set, the tighter one wins."""
     properties = [f'MemoryMax={MEMORY_LIMIT}', f'CPUQuota={int(QUOTA_CORES * 100)}%']
     if is_unified():
         # `AllowedCPUs=` needs a delegated cpuset, which only the unified hierarchy has.

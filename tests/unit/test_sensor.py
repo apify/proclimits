@@ -5,14 +5,13 @@ import json
 import os
 import threading
 from itertools import count
-from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import pytest
 
 import cgroups_sensor
-from cgroups_sensor import _cgroup, _sensor
+from cgroups_sensor import _backend, _cgroup, _sensor, _types
 
 from .conftest import (
     HYBRID_MOUNTINFO,
@@ -26,6 +25,7 @@ from .conftest import (
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from pathlib import Path
 
 MACHINE_TOTAL_BYTES = 8 * 1024**3
 MACHINE_CORES = 8
@@ -41,7 +41,11 @@ HYBRID_STRAY_FILES = {
     'cpu,cpuacct/docker/abc/cpu.cfs_period_us': '100000\n',
     'cpu,cpuacct/docker/abc/cpuacct.usage': '3000000000\n',
 }
-"""A hybrid layout with `hugetlb` on the unified mount and every CPU metric on cgroup v1."""
+"""A hybrid layout with `hugetlb` on the unified mount. The CPU quota and the counter that pairs with it sit
+on cgroup v1, and the unified mount carries counters of another scope."""
+
+NOTICE_PREFIXES = {'memory': ('memory', 'machine-memory'), 'cpu': ('cpu', 'machine-cpu')}
+"""How a notice code names the metric it is about. `machine-memory-unknown` is a memory notice."""
 
 # The autouse fixture below replaces these module attributes, so the tests of the real implementations go
 # through references captured before any fixture runs.
@@ -50,10 +54,26 @@ real_machine_cpu_count = _sensor.get_machine_cpu_count
 
 
 @pytest.fixture(autouse=True)
+def _cgroup_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Read through the cgroup backend whatever platform these tests run on.
+
+    What they cover is the layer above a backend, with the cgroup one standing in for any. On Windows the
+    package wires the job object backend instead, and every fixture here lays out cgroup files.
+    """
+    for name in _backend.__all__:
+        monkeypatch.setattr(_backend, name, getattr(_cgroup, name))
+
+
+@pytest.fixture(autouse=True)
 def _fixed_machine(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Pin the machine facts the filters compare against, so the expected values do not move with the machine."""
+    """Pin the machine facts the filters compare against, so the expected values do not move with the machine.
+
+    The ceiling a memory limit is judged against is pinned separately, because it is a separate reading: the
+    cgroup backend answers both from `/proc/meminfo`, and a job object answers them from different fields.
+    """
     monkeypatch.setattr(_sensor, 'get_machine_memory_bytes', lambda: MACHINE_TOTAL_BYTES)
     monkeypatch.setattr(_sensor, 'get_machine_cpu_count', lambda: MACHINE_CORES)
+    monkeypatch.setattr(_backend, 'memory_limit_ceiling', lambda: MACHINE_TOTAL_BYTES)
 
 
 def fake_time(monkeypatch: pytest.MonkeyPatch, *, sleep: Callable[[float], object]) -> None:
@@ -62,15 +82,11 @@ def fake_time(monkeypatch: pytest.MonkeyPatch, *, sleep: Callable[[float], objec
     monkeypatch.setattr(_sensor, 'time', SimpleNamespace(monotonic=lambda: next(clock), sleep=sleep))
 
 
-NOTICE_PREFIXES = {'memory': ('memory', 'machine-memory'), 'cpu': ('cpu',)}
-"""How a notice code names the metric it is about. `machine-memory-unknown` is a memory notice."""
-
-
 def notice_codes(metric: str | None = None) -> tuple[str, ...]:
     """The notices of the current description, or only those about one metric.
 
-    A fixture that lays out one metric leaves the other without a mechanism, which is itself a notice. Tests
-    of one metric therefore ask for that metric.
+    A fixture that lays out one metric can leave the other with notices of its own. Tests of one metric
+    therefore ask for that metric.
     """
     codes = tuple(str(notice.code) for notice in cgroups_sensor.describe().notices)
     if metric is None:
@@ -80,7 +96,7 @@ def notice_codes(metric: str | None = None) -> tuple[str, ...]:
 
 
 def test_get_memory_budget_restricted(fake_cgroup: Callable[..., Path]) -> None:
-    """Reports a limit below the memory of the machine, with the working set measured against it."""
+    """Reports a limit below the memory of the machine, with the memory in use measured against it."""
     fake_cgroup(
         mountinfo=V2_MOUNTINFO,
         self_cgroup=V2_SELF_CGROUP.format(path='/'),
@@ -91,7 +107,33 @@ def test_get_memory_budget_restricted(fake_cgroup: Callable[..., Path]) -> None:
         },
     )
 
-    assert cgroups_sensor.get_memory_budget() == cgroups_sensor.MemoryBudget(limit=536870912, working_set=100000000)
+    assert cgroups_sensor.get_memory_budget() == cgroups_sensor.MemoryBudget(
+        limit=536870912, used=100000000, available=436870912
+    )
+    assert notice_codes('memory') == ()
+
+
+def test_get_memory_budget_above_the_machine_below_the_ceiling(
+    fake_cgroup: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keeps a limit above the memory of the machine where the mechanism can still hand out that much."""
+    fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/'),
+        files={
+            'memory.max': f'{MACHINE_TOTAL_BYTES + 4 * 1024**3}\n',
+            'memory.current': '150000000\n',
+            'memory.stat': 'inactive_file 50000000\n',
+        },
+    )
+    # A Windows job limits commit, which the page file lifts above the memory of the machine.
+    monkeypatch.setattr(_backend, 'memory_limit_ceiling', lambda: MACHINE_TOTAL_BYTES * 2)
+
+    budget = cgroups_sensor.get_memory_budget()
+
+    assert budget is not None
+    assert budget.limit == MACHINE_TOTAL_BYTES + 4 * 1024**3
     assert notice_codes('memory') == ()
 
 
@@ -128,23 +170,75 @@ def test_get_memory_budget_v1_sentinel(fake_cgroup: Callable[..., Path]) -> None
     # The raw sentinel stays visible next to the machine memory it lost to.
     description = cgroups_sensor.describe()
     assert description.raw_memory_limit == 9223372036854771712
-    assert description.raw_memory_working_set == 600
+    assert description.raw_memory_used == 600
 
 
-def test_get_memory_budget_no_working_set(fake_cgroup: Callable[..., Path]) -> None:
-    """Drops a limit that no usage can be paired with, and says why instead of pairing it with the raw usage."""
-    fake_cgroup(
+def test_get_memory_budget_no_used(fake_cgroup: Callable[..., Path]) -> None:
+    """Drops a limit whose usage did not answer, and calls that a failed read rather than a shape."""
+    root = fake_cgroup(
         mountinfo=V2_MOUNTINFO,
         self_cgroup=V2_SELF_CGROUP.format(path='/'),
         files={'memory.max': '536870912\n', 'memory.current': '1000\n', 'memory.stat': 'anon 600\n'},
     )
 
     assert cgroups_sensor.get_memory_budget() is None
-    assert notice_codes('memory') == ('memory-usage-unavailable',)
+    assert notice_codes('memory') == ('memory-usage-unreadable',)
     # The pair that explains the rejection stays visible: a limit next to no usable usage.
     description = cgroups_sensor.describe()
     assert description.raw_memory_limit == 536870912
-    assert description.raw_memory_working_set is None
+    assert description.raw_memory_used is None
+    # The level that went quiet is named, which is what makes this worth investigating.
+    assert str(root) in description.notices[0].message
+
+
+def test_get_memory_budget_usage_the_mechanism_does_not_offer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Separates a limit no usage figure pairs with from one whose usage failed to read."""
+    raw = _types.RawMemory(
+        limit=256 * 1024 * 1024,
+        used=None,
+        available=None,
+        limit_level='job',
+        unreadable_level=None,
+        usage_unreadable_level=None,
+    )
+    monkeypatch.setattr(_backend, 'read_memory', lambda: raw)
+
+    assert cgroups_sensor.get_memory_budget() is None
+    assert notice_codes('memory') == ('memory-usage-unavailable',)
+
+
+def test_get_memory_budget_brings_a_disagreeing_triple_into_range(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clamps a usage above the limit and a room above what is left, which three separate calls can report."""
+    raw = _types.RawMemory(
+        limit=1000,
+        used=1200,
+        available=900,
+        limit_level='job',
+        unreadable_level=None,
+        usage_unreadable_level=None,
+    )
+    monkeypatch.setattr(_backend, 'read_memory', lambda: raw)
+
+    budget = cgroups_sensor.get_memory_budget()
+
+    assert budget == cgroups_sensor.MemoryBudget(limit=1000, used=1000, available=0)
+    # What the mechanism said is kept, so a consumer can see the calls disagreed.
+    assert cgroups_sensor.describe().raw_memory_used == 1200
+
+
+def test_get_memory_budget_keeps_a_room_the_mechanism_made_smaller(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Leaves a room below the distance alone, a mechanism knowing of pressure the subtraction does not."""
+    raw = _types.RawMemory(
+        limit=1000,
+        used=250,
+        available=100,
+        limit_level='job',
+        unreadable_level=None,
+        usage_unreadable_level=None,
+    )
+    monkeypatch.setattr(_backend, 'read_memory', lambda: raw)
+
+    assert cgroups_sensor.get_memory_budget() == cgroups_sensor.MemoryBudget(limit=1000, used=250, available=100)
 
 
 def test_get_memory_budget_fake_limit_without_usage(fake_cgroup: Callable[..., Path]) -> None:
@@ -164,6 +258,63 @@ def test_get_memory_budget_no_mechanism() -> None:
     """Reports nothing when no mechanism carries a limit, and says that is what happened."""
     assert cgroups_sensor.get_memory_budget() is None
     assert notice_codes() == ('memory-metrics-unavailable', 'cpu-metrics-unavailable')
+
+
+@pytest.mark.parametrize(
+    'bound',
+    [
+        pytest.param({'cgroup.controllers': 'cpu\n'}, id='the hierarchy lists what it binds'),
+        pytest.param({}, id='the hierarchy does not say'),
+    ],
+)
+def test_an_unbound_memory_controller_is_not_a_missing_mechanism(
+    fake_cgroup: Callable[..., Path], bound: dict[str, str]
+) -> None:
+    """Says nothing where a mounted hierarchy binds no memory controller: unbound enforces nothing."""
+    fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/'),
+        files={'cpu.max': '50000 100000\n', 'cpu.stat': 'usage_usec 0\n', **bound},
+    )
+
+    description = cgroups_sensor.describe()
+
+    assert description.memory_budget is None
+    assert description.memory_source == cgroups_sensor.Source(interface=cgroups_sensor.Interface.CGROUP_V2, levels=())
+    # `memory-metrics-unavailable` would say this machine has no cgroups, which is what it is mounting.
+    assert description.notices == ()
+
+
+@pytest.mark.parametrize(
+    'bound',
+    [
+        pytest.param({'cgroup.controllers': 'memory\n'}, id='the hierarchy lists what it binds'),
+        pytest.param({}, id='the hierarchy does not say'),
+    ],
+)
+def test_an_unbound_controller_is_not_a_missing_mechanism(
+    fake_cgroup: Callable[..., Path], bound: dict[str, str]
+) -> None:
+    """Says nothing where a mounted hierarchy binds no CPU controller: unbound enforces nothing."""
+    fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/'),
+        files={
+            'memory.max': '536870912\n',
+            'memory.current': '1000\n',
+            'memory.stat': 'inactive_file 400\n',
+            **bound,
+        },
+    )
+
+    description = cgroups_sensor.describe()
+
+    assert description.cpu_limit is None
+    assert description.cpu_quota_source == cgroups_sensor.Source(
+        interface=cgroups_sensor.Interface.CGROUP_V2, levels=()
+    )
+    # `cpu-metrics-unavailable` would say this machine has no cgroups, which is what it is mounting.
+    assert description.notices == ()
 
 
 def test_get_memory_budget_exactly_the_machine(fake_cgroup: Callable[..., Path]) -> None:
@@ -194,7 +345,7 @@ def test_get_memory_budget_unknown_machine_memory(
     monkeypatch: pytest.MonkeyPatch,
     limit: int,
 ) -> None:
-    """Drops any limit when the memory of the machine is unknown, because the sentinel cannot be told apart."""
+    """Drops any limit when the size it is judged against is unknown, because the sentinel cannot be told apart."""
     fake_cgroup(
         mountinfo=V1_MOUNTINFO,
         self_cgroup=V1_SELF_CGROUP.format(path='/'),
@@ -204,7 +355,7 @@ def test_get_memory_budget_unknown_machine_memory(
             'memory/memory.stat': 'total_inactive_file 400\n',
         },
     )
-    monkeypatch.setattr(_sensor, 'get_machine_memory_bytes', lambda: None)
+    monkeypatch.setattr(_backend, 'memory_limit_ceiling', lambda: None)
 
     assert cgroups_sensor.get_memory_budget() is None
     assert notice_codes('memory') == ('machine-memory-unknown',)
@@ -236,14 +387,12 @@ def test_get_cpu_limit(
     expected: float | None,
 ) -> None:
     """Takes the tighter of the bandwidth quota and the CPU set, which restrict the CPU independently."""
-    counter = Path('/sys/fs/cgroup')
-    raw_quota = (
-        None if quota is None else _cgroup.RawCpuQuota(cores=quota, limit_directory=counter, usage_directory=counter)
-    )
+    counter = '/sys/fs/cgroup'
+    raw_quota = None if quota is None else _cgroup.RawCpuQuota(cores=quota, limit_level=counter, usage_level=counter)
     raw_set = (
         None
         if cpu_set_cores is None
-        else _cgroup.RawCpuSet(cores=cpu_set_cores, limit_directory=counter, usage_directory=counter)
+        else _cgroup.RawCpuSet(cores=cpu_set_cores, limit_level=counter, usage_level=counter)
     )
     monkeypatch.setattr(_cgroup, 'read_cpu_quota', lambda: raw_quota)
     monkeypatch.setattr(_cgroup, 'read_cpu_set_size', lambda: raw_set)
@@ -255,14 +404,42 @@ def test_get_cpu_limit(
 @pytest.mark.usefixtures('_no_cgroup')
 def test_get_cpu_limit_notices(monkeypatch: pytest.MonkeyPatch) -> None:
     """Explains each reading that covers the machine, so a missing limit is attributable."""
-    counter = Path('/sys/fs/cgroup')
-    quota = _cgroup.RawCpuQuota(cores=10.0, limit_directory=counter, usage_directory=counter)
+    counter = '/sys/fs/cgroup'
+    quota = _cgroup.RawCpuQuota(cores=10.0, limit_level=counter, usage_level=counter)
     monkeypatch.setattr(_cgroup, 'read_cpu_quota', lambda: quota)
-    cpu_set = _cgroup.RawCpuSet(cores=8, limit_directory=counter, usage_directory=counter)
+    cpu_set = _cgroup.RawCpuSet(cores=8, limit_level=counter, usage_level=counter)
     monkeypatch.setattr(_cgroup, 'read_cpu_set_size', lambda: cpu_set)
 
     assert cgroups_sensor.get_cpu_limit() is None
     assert notice_codes('cpu') == ('cpu-quota-covers-machine', 'cpu-set-covers-machine')
+
+
+def test_cpu_limit_from_an_unsizeable_share(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reports nothing, and names the level, where a limit is a share of a machine of unknown size."""
+    raw = _cgroup.RawCpu(quota=None, cpu_set=None, unreadable_level=None, unconvertible_level='job')
+    monkeypatch.setattr(_backend, 'read_cpu', lambda: raw)
+
+    assert cgroups_sensor.get_cpu_limit() is None
+    assert notice_codes('cpu') == ('machine-cpu-count-unknown',)
+    assert 'job' in next(n.message for n in cgroups_sensor.describe().notices if str(n.code).startswith('machine-cpu'))
+
+
+def test_an_unsizeable_share_drops_the_other_reading(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Drops a reading in cores alongside it, because the share that cannot be sized may be the tighter one."""
+    counter = '/sys/fs/cgroup'
+    raw = _cgroup.RawCpu(
+        quota=_cgroup.RawCpuQuota(cores=4.0, limit_level=counter, usage_level=counter),
+        cpu_set=_cgroup.RawCpuSet(cores=2, limit_level=counter, usage_level=counter),
+        unreadable_level=None,
+        unconvertible_level='job',
+    )
+    monkeypatch.setattr(_backend, 'read_cpu', lambda: raw)
+
+    description = cgroups_sensor.describe()
+
+    assert description.cpu_limit is None
+    assert (description.raw_cpu_quota, description.raw_cpu_set_size) == (None, None)
+    assert notice_codes('cpu') == ('machine-cpu-count-unknown',)
 
 
 def test_get_cpu_used_ratio(fake_cgroup: Callable[..., Path], monkeypatch: pytest.MonkeyPatch) -> None:
@@ -283,12 +460,13 @@ def test_get_cpu_used_ratio_counter_restart(
     fake_cgroup: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Clamps the counter that restarts when the process is moved to another group."""
+    """Clamps the counter that restarts when a cgroup of this path is created anew."""
     root = fake_cgroup(
         mountinfo=V2_MOUNTINFO,
         self_cgroup=V2_SELF_CGROUP.format(path='/'),
         files={'cpu.max': '200000 100000\n', 'cpu.stat': 'usage_usec 5000000\n'},
     )
+    # A restarted unit takes the path of the one before it, and its counter starts at zero.
     fake_time(monkeypatch, sleep=lambda _seconds: (root / 'cpu.stat').write_text('usage_usec 0\n'))
 
     assert cgroups_sensor.get_cpu_used_ratio() == 0.0
@@ -328,8 +506,8 @@ def test_notices_a_mount_that_hides_the_ancestors(fake_cgroup: Callable[..., Pat
         },
     )
 
-    assert 'memory-mount-hides-ancestors' in notice_codes('memory')
-    assert 'cpu-mount-hides-ancestors' not in notice_codes('cpu')
+    assert 'memory-ancestors-hidden' in notice_codes('memory')
+    assert 'cpu-ancestors-hidden' not in notice_codes('cpu')
 
 
 def test_no_notice_when_the_mount_covers_the_whole_hierarchy(fake_cgroup: Callable[..., Path]) -> None:
@@ -340,7 +518,7 @@ def test_no_notice_when_the_mount_covers_the_whole_hierarchy(fake_cgroup: Callab
         files={'pod/memory.max': '1000\n', 'pod/memory.current': '100\n', 'pod/memory.stat': 'inactive_file 0\n'},
     )
 
-    assert 'memory-mount-hides-ancestors' not in notice_codes()
+    assert 'memory-ancestors-hidden' not in notice_codes()
 
 
 def test_get_cpu_usage_hybrid_with_a_stray_controller(fake_cgroup: Callable[..., Path]) -> None:
@@ -524,7 +702,7 @@ def test_snapshot(fake_cgroup: Callable[..., Path]) -> None:
     )
 
     assert cgroups_sensor.snapshot() == cgroups_sensor.Snapshot(
-        memory_budget=cgroups_sensor.MemoryBudget(limit=536870912, working_set=100000000),
+        memory_budget=cgroups_sensor.MemoryBudget(limit=536870912, used=100000000, available=436870912),
         cpu_limit=2.0,
         cpu_usage=2.5,
     )
@@ -537,7 +715,7 @@ def test_snapshot_no_mechanism() -> None:
 
 
 def test_snapshot_v1(fake_cgroup: Callable[..., Path]) -> None:
-    """Reads every metric through the cgroup v1 controllers, each mounted as a hierarchy of its own."""
+    """Reads every metric through the cgroup v1 controllers, spread over the mounts that carry them."""
     fake_cgroup(
         mountinfo=V1_MOUNTINFO,
         self_cgroup=V1_SELF_CGROUP.format(path='/'),
@@ -553,7 +731,7 @@ def test_snapshot_v1(fake_cgroup: Callable[..., Path]) -> None:
     )
 
     assert cgroups_sensor.snapshot() == cgroups_sensor.Snapshot(
-        memory_budget=cgroups_sensor.MemoryBudget(limit=536870912, working_set=600),
+        memory_budget=cgroups_sensor.MemoryBudget(limit=536870912, used=600, available=536870312),
         cpu_limit=1.5,
         cpu_usage=2.5,
     )
@@ -589,14 +767,16 @@ def test_describe(fake_cgroup: Callable[..., Path]) -> None:
     v2 = cgroups_sensor.Interface.CGROUP_V2
 
     # The readings themselves, so that one dump of this is a complete answer.
-    assert description.memory_budget == cgroups_sensor.MemoryBudget(limit=536870912, working_set=100000000)
+    assert description.memory_budget == cgroups_sensor.MemoryBudget(
+        limit=536870912, used=100000000, available=436870912
+    )
     assert description.cpu_limit == 4.0
     assert description.memory_source == cgroups_sensor.Source(interface=v2, levels=(str(root),))
     assert description.cpu_quota_source == cgroups_sensor.Source(interface=v2, levels=(str(root),))
     assert description.cpu_set_source == cgroups_sensor.Source(interface=v2, levels=(str(root),))
     assert description.cpu_usage_source == cgroups_sensor.Source(interface=v2, levels=(str(root),))
     assert description.raw_memory_limit == 536870912
-    assert description.raw_memory_working_set == 100000000
+    assert description.raw_memory_used == 100000000
     assert description.memory_limit_level == str(root)
     # The set of four cores is the effective limit here, and its time is counted in the own cgroup.
     assert description.cpu_limit_level == str(root)
@@ -624,7 +804,50 @@ def test_describe_hybrid_interfaces(fake_cgroup: Callable[..., Path]) -> None:
 
     assert description.memory_source is not None
     assert description.memory_source.interface is cgroups_sensor.Interface.CGROUP_V1
-    assert description.cpu_quota_source is None
+    # Nothing binds a CPU controller here, so the source searches no levels rather than going missing. It is
+    # named cgroup v1 like the memory beside it, the unified mount of a hybrid machine carrying nothing.
+    assert description.cpu_quota_source == cgroups_sensor.Source(
+        interface=cgroups_sensor.Interface.CGROUP_V1, levels=()
+    )
+    assert [notice.code for notice in description.notices] == []
+
+
+def test_describe_ignores_a_stray_controller_when_naming_an_absent_metric(
+    fake_cgroup: Callable[..., Path],
+) -> None:
+    """Names cgroup v1 for a metric nothing carries, a stray controller on the cgroup2 mount notwithstanding."""
+    fake_cgroup(mountinfo=HYBRID_MOUNTINFO, self_cgroup=HYBRID_SELF_CGROUP, files=HYBRID_STRAY_FILES)
+
+    description = cgroups_sensor.describe()
+
+    # `hugetlb` rides the unified mount and none of the metrics here can: a controller is bound to one
+    # hierarchy at a time, so this machine would serve its memory through cgroup v1 or not at all.
+    assert description.memory_source == cgroups_sensor.Source(interface=cgroups_sensor.Interface.CGROUP_V1, levels=())
+
+
+def test_describe_names_cgroup_v2_for_an_absent_metric_where_it_binds_the_others(
+    fake_cgroup: Callable[..., Path],
+) -> None:
+    """Names the unified hierarchy where it binds the controllers this package reads, cgroup v1 mounts and all."""
+    fake_cgroup(
+        mountinfo=HYBRID_MOUNTINFO,
+        self_cgroup=HYBRID_SELF_CGROUP,
+        files={
+            # The memory controller moved to the unified hierarchy, so a cpuset would appear there too.
+            'unified/cgroup.controllers': 'memory\n',
+            'unified/system.slice/docker.service/memory.max': '536870912\n',
+            'unified/system.slice/docker.service/memory.current': '1000\n',
+            'unified/system.slice/docker.service/memory.stat': 'inactive_file 400\n',
+            'cpu,cpuacct/docker/abc/cpu.cfs_quota_us': '50000\n',
+            'cpu,cpuacct/docker/abc/cpu.cfs_period_us': '100000\n',
+        },
+    )
+
+    description = cgroups_sensor.describe()
+
+    assert description.memory_source is not None
+    assert description.memory_source.interface is cgroups_sensor.Interface.CGROUP_V2
+    assert description.cpu_set_source == cgroups_sensor.Source(interface=cgroups_sensor.Interface.CGROUP_V2, levels=())
 
 
 def test_describe_names_the_level_the_memory_limit_came_from(fake_cgroup: Callable[..., Path]) -> None:
@@ -715,8 +938,8 @@ def test_spell_cores(cores: float, expected: str) -> None:
 @pytest.mark.usefixtures('_no_cgroup')
 def test_covers_machine_notice_spells_the_cores(monkeypatch: pytest.MonkeyPatch) -> None:
     """Says "64 allowed cores" in the message a consumer reads, not "64.0" - a set has no fractional size."""
-    counter = Path('/sys/fs/cgroup')
-    cpu_set = _cgroup.RawCpuSet(cores=64, limit_directory=counter, usage_directory=counter)
+    counter = '/sys/fs/cgroup'
+    cpu_set = _cgroup.RawCpuSet(cores=64, limit_level=counter, usage_level=counter)
     monkeypatch.setattr(_cgroup, 'read_cpu_quota', lambda: None)
     monkeypatch.setattr(_cgroup, 'read_cpu_set_size', lambda: cpu_set)
 
@@ -726,7 +949,7 @@ def test_covers_machine_notice_spells_the_cores(monkeypatch: pytest.MonkeyPatch)
 
 
 def test_every_notice_code_names_its_metric() -> None:
-    """Spells every code as `<metric>-...`, which is the only thing telling a memory notice from a CPU one."""
+    """Names one metric in every code, which is the only thing telling a memory notice from a CPU one."""
     metrics = {
         str(code): [metric for metric, prefixes in NOTICE_PREFIXES.items() if str(code).startswith(prefixes)]
         for code in cgroups_sensor.NoticeCode
@@ -769,7 +992,9 @@ def test_clear_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_cgrou
 
     cgroups_sensor.clear_cache()
 
-    assert cgroups_sensor.get_memory_budget() == cgroups_sensor.MemoryBudget(limit=536870912, working_set=100000000)
+    assert cgroups_sensor.get_memory_budget() == cgroups_sensor.MemoryBudget(
+        limit=536870912, used=100000000, available=436870912
+    )
 
 
 @pytest.mark.parametrize(
@@ -790,14 +1015,14 @@ def test_machine_memory_bytes(
     """Parses the machine memory out of `/proc/meminfo`, and reports nothing rather than raising on any other."""
     meminfo = tmp_path / 'meminfo'
     meminfo.write_text(content)
-    monkeypatch.setattr(_sensor, '_PROC_MEMINFO', meminfo)
+    monkeypatch.setattr(_cgroup, '_PROC_MEMINFO', meminfo)
 
     assert real_machine_memory_bytes() == expected
 
 
 def test_machine_memory_bytes_missing_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Reports nothing on a system without `/proc/meminfo`."""
-    monkeypatch.setattr(_sensor, '_PROC_MEMINFO', tmp_path / 'missing')
+    monkeypatch.setattr(_cgroup, '_PROC_MEMINFO', tmp_path / 'missing')
 
     assert real_machine_memory_bytes() is None
 
@@ -814,7 +1039,7 @@ def test_machine_cpu_count(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, onli
     """Counts the cores the kernel lists as online, whatever the process is allowed to run on."""
     listing = tmp_path / 'online'
     listing.write_text(online)
-    monkeypatch.setattr(_sensor, '_SYS_CPU_ONLINE', listing)
+    monkeypatch.setattr(_cgroup, '_SYS_CPU_ONLINE', listing)
     # Numbers no case expects, so that a count taken from a fallback instead of the listing fails here.
     # `raising=False`, because Windows has no `os.sysconf` to replace.
     monkeypatch.setattr(os, 'sysconf', lambda _name: 99, raising=False)
@@ -825,7 +1050,7 @@ def test_machine_cpu_count(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, onli
 
 def test_machine_cpu_count_ignores_process_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Falls back to `sysconf` where the kernel lists nothing, and not to the `PYTHON_CPU_COUNT` override."""
-    monkeypatch.setattr(_sensor, '_SYS_CPU_ONLINE', tmp_path / 'missing')
+    monkeypatch.setattr(_cgroup, '_SYS_CPU_ONLINE', tmp_path / 'missing')
     monkeypatch.setattr(os, 'sysconf', lambda _name: 16, raising=False)
     monkeypatch.setattr(os, 'cpu_count', lambda: 2)
 
@@ -851,7 +1076,7 @@ def test_machine_cpu_count_fallback(
             raise sysconf_result
         return sysconf_result
 
-    monkeypatch.setattr(_sensor, '_SYS_CPU_ONLINE', tmp_path / 'missing')
+    monkeypatch.setattr(_cgroup, '_SYS_CPU_ONLINE', tmp_path / 'missing')
     monkeypatch.setattr(os, 'sysconf', sysconf, raising=False)
     monkeypatch.setattr(os, 'cpu_count', lambda: 2)
 
@@ -863,6 +1088,8 @@ def loaded_slice(fake_cgroup: Callable[..., Path], *, own_usec: int, slice_usec:
 
     This is the shape a `CPUQuota=` slice with several busy units in it produces: the process of interest is
     nearly idle, while the level the quota throttles is saturated.
+
+    The counter of a level counts its whole subtree, so `slice_usec` has to include `own_usec`.
     """
     return fake_cgroup(
         mountinfo=V2_MOUNTINFO,
@@ -881,11 +1108,13 @@ def test_get_cpu_used_ratio_measures_where_the_quota_binds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Measures the level the quota throttles, not the idle process inside it."""
-    root = loaded_slice(fake_cgroup, own_usec=7100, slice_usec=0)
+    # The service has burned every microsecond the slice counts so far, the other units in it being idle.
+    root = loaded_slice(fake_cgroup, own_usec=7100, slice_usec=7100)
 
     def sleep(_seconds: float) -> None:
+        # The process adds another 7100 microseconds; the busy units beside it take the slice half a second on.
         (root / 'bench.slice' / 'own.service' / 'cpu.stat').write_text('usage_usec 14200\n')
-        (root / 'bench.slice' / 'cpu.stat').write_text('usage_usec 500000\n')
+        (root / 'bench.slice' / 'cpu.stat').write_text('usage_usec 507100\n')
 
     fake_time(monkeypatch, sleep=sleep)
 
@@ -907,7 +1136,7 @@ def test_cpu_load_measures_between_calls(
     fake_cgroup: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Measures across the time between two calls, and blocks for nothing."""
+    """Measures across the time between two calls."""
     root = fake_cgroup(
         mountinfo=V2_MOUNTINFO,
         self_cgroup=V2_SELF_CGROUP.format(path='/'),
@@ -925,7 +1154,7 @@ def test_cpu_load_measures_between_calls(
 
 
 def test_cpu_load_counter_restart(fake_cgroup: Callable[..., Path], monkeypatch: pytest.MonkeyPatch) -> None:
-    """Clamps the counter that restarts when the process is moved to another group."""
+    """Clamps the counter that restarts when a cgroup of this path is created anew."""
     root = fake_cgroup(
         mountinfo=V2_MOUNTINFO,
         self_cgroup=V2_SELF_CGROUP.format(path='/'),
@@ -958,7 +1187,8 @@ def test_cpu_load_keeps_the_previous_reading(
     (root / 'cpu.stat').unlink()
     assert load.sample() is None
 
-    # Two core-seconds against the two the quota allows, over the two seconds the clock advanced meanwhile.
+    # Four core-seconds against the two the quota allows over that window, so the ratio comes back clamped.
+    # The failed read took no clock reading, so the window is the one second between the samples that worked.
     (root / 'cpu.stat').write_text('usage_usec 4000000\n')
     assert load.sample() == pytest.approx(1.0)
 
@@ -986,7 +1216,7 @@ def test_no_rate_without_a_counter_for_the_limit(
         self_cgroup=V2_SELF_CGROUP.format(path='/'),
         files={'cpu.max': '200000 100000\n', 'cpu.stat': 'usage_usec 0\n'},
     )
-    quota = _cgroup.RawCpuQuota(cores=2.0, limit_directory=Path('/sys/fs/cgroup'), usage_directory=None)
+    quota = _cgroup.RawCpuQuota(cores=2.0, limit_level='/sys/fs/cgroup', usage_level=None)
     monkeypatch.setattr(_cgroup, 'read_cpu_quota', lambda: quota)
     monkeypatch.setattr(_cgroup, 'read_cpu_set_size', lambda: None)
 
@@ -1076,7 +1306,6 @@ def test_cpu_load_sampled_from_several_threads(fake_cgroup: Callable[..., Path])
     samples: list[float | None] = []
 
     def sample_repeatedly() -> None:
-        # One `extend` per thread, so that the list is touched as rarely as the sampler allows.
         samples.extend(load.sample() for _ in range(50))
 
     threads = [threading.Thread(target=sample_repeatedly) for _ in range(8)]
@@ -1221,17 +1450,15 @@ def test_nothing_raises_on_directories_instead_of_files(
     assert cgroups_sensor.describe().memory_source is None
 
 
-def test_memory_budget_derived_numbers() -> None:
-    """Reports what a consumer would otherwise compute, and the same way everywhere."""
-    budget = cgroups_sensor.MemoryBudget(limit=1000, working_set=250)
+def test_memory_budget_used_ratio() -> None:
+    """Reports the share of the limit in use, which a consumer would otherwise compute."""
+    budget = cgroups_sensor.MemoryBudget(limit=1000, used=250, available=750)
 
-    assert budget.available == 750
     assert budget.used_ratio == 0.25
 
 
 def test_memory_budget_of_zero() -> None:
-    """Calls a cgroup that may hold no memory fully used, rather than dividing by its limit."""
-    budget = cgroups_sensor.MemoryBudget(limit=0, working_set=0)
+    """Calls a group that may hold no memory fully used, rather than dividing by its limit."""
+    budget = cgroups_sensor.MemoryBudget(limit=0, used=0, available=0)
 
-    assert budget.available == 0
     assert budget.used_ratio == 1.0

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import atexit
+import dataclasses
 import json
 import os
 import platform
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -19,7 +22,7 @@ SRC_DIR = REPO_ROOT / 'src'
 PROBE = Path(__file__).parent / 'probe.py'
 
 IMAGE = 'python:3.13-alpine'
-"""The image the container tests use. uv brings the interpreter, so this one only has to be small."""
+"""The image the container tests use. A small musl image, and it ships `PYTHON_VERSION` itself."""
 
 DOCKER_HUB = 'docker.io'
 """The registry the images above live in, for the engines that do not assume one."""
@@ -57,15 +60,93 @@ DISTRO_IMAGES = (
 """Images the readings are compared across: musl, Debian glibc, and two distributions of another family."""
 
 PYTHON_VERSION = '3.13'
-"""The interpreter every probe runs on. uv installs it, so the image does not decide the version."""
+"""The Python version the container lanes and the Windows stage ask uv for. The image supplies it where it matches."""
 
 PYTHON_VERSIONS = ('3.10', '3.11', '3.12', '3.13', '3.14')
-"""Every interpreter the package supports, as `requires-python` spells it."""
+"""Every interpreter the package supports, as the classifiers list them."""
 
 UV_DOWNLOADS = Path(tempfile.gettempdir()) / 'cgroups-sensor-e2e-uv'
 """Where uv and its interpreters are kept, so only the first run pays for the download."""
 
+WINDOWS_DOWNLOADS = Path(tempfile.gettempdir()) / 'cgroups-sensor-e2e-windows'
+"""Where each run stages the Windows interpreter and the probe."""
+
+WINDOWS_MOUNT = 'C:\\probe'
+"""Where the staged directory is mounted inside a Windows container."""
+
 MIB = 1024 * 1024
+
+JOB_MEMBERSHIP = (
+    'import ctypes;'
+    'from ctypes import wintypes;'
+    'k = ctypes.WinDLL("kernel32", use_last_error=True);'
+    'k.GetCurrentProcess.restype = wintypes.HANDLE;'
+    'k.IsProcessInJob.argtypes = (wintypes.HANDLE, wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL));'
+    'answer = wintypes.BOOL();'
+    'print(bool(k.IsProcessInJob(k.GetCurrentProcess(), None, ctypes.byref(answer)) and answer.value))'
+)
+"""Asks Windows whether the process running it is in a job. Spelled out here rather than asked of the package,
+as the core count is."""
+
+WINDOWS_MACHINE_FACTS = """
+import ctypes
+from ctypes import wintypes
+
+
+class MemoryStatus(ctypes.Structure):
+    _fields_ = (
+        ('dwLength', wintypes.DWORD),
+        ('dwMemoryLoad', wintypes.DWORD),
+        ('ullTotalPhys', ctypes.c_ulonglong),
+        ('ullAvailPhys', ctypes.c_ulonglong),
+        ('ullTotalPageFile', ctypes.c_ulonglong),
+        ('ullAvailPageFile', ctypes.c_ulonglong),
+        ('ullTotalVirtual', ctypes.c_ulonglong),
+        ('ullAvailVirtual', ctypes.c_ulonglong),
+        ('ullAvailExtendedVirtual', ctypes.c_ulonglong),
+    )
+
+
+kernel32 = ctypes.WinDLL('kernel32')
+kernel32.GetActiveProcessorCount.argtypes = (wintypes.WORD,)
+kernel32.GetActiveProcessorCount.restype = wintypes.DWORD
+
+status = MemoryStatus()
+status.dwLength = ctypes.sizeof(status)
+kernel32.GlobalMemoryStatusEx(ctypes.byref(status))
+print(status.ullTotalPhys, status.ullTotalPageFile, kernel32.GetActiveProcessorCount(0xFFFF))
+"""
+"""A program that prints what this machine says about itself, spelled independently of the package.
+
+`MEMORYSTATUSEX` is re-declared rather than imported for the reason `job.py` re-declares its structures: an
+instrument that shares a layout with its subject agrees with a broken one. The cores are asked of the kernel
+for a second reason - `os.cpu_count()` honors `PYTHON_CPU_COUNT` and `-X cpu_count` from Python 3.13 on, and
+this count does not only check a reading here, it decides the rates and masks the lane sets.
+"""
+
+INFORMATIONAL_NOTICES = frozenset({'memory-ancestors-hidden', 'cpu-ancestors-hidden'})
+"""Notices that report what the mechanism cannot see.
+
+The shape of the mount raises them, so they explain no `None`. Kept apart because the check that a missing
+reading was explained would otherwise be satisfied by a notice that explains something else - and on a
+truncated mount, which is a shape the container lane builds, it would be satisfied every time.
+"""
+
+DERIVED_AVAILABLE = frozenset({'cgroup-v1', 'cgroup-v2'})
+"""Interfaces that work the room out from one walk, so the three raw numbers agree exactly."""
+
+MEASURED_AVAILABLE = frozenset({'windows-job-object'})
+"""Interfaces that answer the room from a call of its own, so it can drift from the distance either way."""
+
+DRIFT_ALLOWANCE = 8 * MIB
+"""How far either way a separately read room may sit from the distance before it counts as wrong.
+
+The usage is read first and the room second. Memory freed between the two calls puts the room above the
+distance, memory committed puts it below. Both sides are checked.
+
+Wide enough for a probe that does nothing but read, narrow enough that a reading off by a factor still fails:
+the limits here are hundreds of megabytes.
+"""
 MEMORY_LIMIT = 512 * MIB
 TIGHTER_MEMORY_LIMIT = 256 * MIB
 QUOTA_CORES = 0.5
@@ -76,9 +157,18 @@ TIMEOUT_SECONDS = 300
 CANNOT_SET_UP = 77
 """What a wrapper exits with when it could not produce the shape a test needs.
 
-Both fail the run, but differently: the layout could not be built, or it was built and the reading is wrong.
-Without this the setup breaks silently and the assertion afterwards blames the sensor for it.
+`run()` tells it apart from any other exit code, and fails the test naming the layout rather than the sensor.
 """
+
+
+def _interfaces_of(sources: dict[str, Any]) -> set[str]:
+    """The mechanisms among these sources that a reading could have come from.
+
+    A source searching no levels found nowhere to read: its interface is the one that would have carried the
+    metric, not one anything came through. Counting it would put the machine-wide interface into the set for a
+    metric nothing served, and leave an empty set unreachable wherever a mechanism is mounted at all.
+    """
+    return {source['interface'] for source in sources.values() if source is not None and source['levels']}
 
 
 @dataclass(frozen=True)
@@ -87,18 +177,21 @@ class Reading:
 
     version: str
     memory_limit: int | None
-    working_set: int | None
+    used: int | None
+    available: int | None
     cpu_limit: float | None
     cpu_usage: float | None
     cpu_used_ratio: float | None
     raw_memory_limit: int | None
-    raw_memory_working_set: int | None
+    raw_memory_used: int | None
+    raw_memory_available: int | None
     raw_cpu_quota: float | None
     raw_cpu_set_size: int | None
     memory_limit_level: str | None
     cpu_limit_level: str | None
     cpu_rate_level: str | None
     machine_memory_bytes: int | None
+    memory_limit_ceiling: int | None
     machine_cpu_count: int | None
     allocated: int
     notices: tuple[str, ...]
@@ -106,8 +199,8 @@ class Reading:
 
     @property
     def interfaces(self) -> set[str]:
-        """The mechanisms the readings came from, e.g. `{'cgroup-v1'}`."""
-        return {source['interface'] for source in self.sources.values() if source is not None}
+        """The mechanisms that had a level to search, e.g. `{'cgroup-v1'}`."""
+        return _interfaces_of(self.sources)
 
     @property
     def limit_interfaces(self) -> set[str]:
@@ -116,35 +209,23 @@ class Reading:
         The consumed CPU time is left out. Where no hierarchy counts anything, the base `cpu.stat` of a
         controller-less cgroup2 is all there is.
         """
-        return {
-            source['interface'] for name, source in self.sources.items() if name != 'cpu_usage' and source is not None
-        }
+        return _interfaces_of({name: source for name, source in self.sources.items() if name != 'cpu_usage'})
 
     def __repr__(self) -> str:
-        """Spell the numbers a failing assertion needs, with the sources summarized rather than dumped."""
-        fields = ', '.join(
-            f'{name}={getattr(self, name)!r}'
-            for name in (
-                'memory_limit',
-                'working_set',
-                'cpu_limit',
-                'cpu_usage',
-                'cpu_used_ratio',
-                'raw_memory_limit',
-                'raw_memory_working_set',
-                'raw_cpu_quota',
-                'raw_cpu_set_size',
-                'memory_limit_level',
-                'cpu_limit_level',
-                'cpu_rate_level',
-                'machine_memory_bytes',
-                'machine_cpu_count',
-                'notices',
-            )
+        """Spell the numbers a failing assertion needs, with the sources summarized rather than dumped.
+
+        Taken from the fields themselves, so a number the probe starts reporting shows up in a failure without
+        being listed twice. The three left out carry nothing a failure is read with: two are constants of the
+        run, and the sources are summarized below instead.
+        """
+        spelled = ', '.join(
+            f'{field.name}={getattr(self, field.name)!r}'
+            for field in dataclasses.fields(self)
+            if field.name not in {'version', 'allocated', 'sources'}
         )
         levels = {name: (source or {}).get('levels') for name, source in self.sources.items()}
 
-        return f'Reading({fields}, interfaces={sorted(self.interfaces)}, levels={levels})'
+        return f'Reading({spelled}, interfaces={sorted(self.interfaces)}, levels={levels})'
 
 
 def parse(output: str) -> Reading:
@@ -213,7 +294,7 @@ def probe_here(wrapper: list[str] | None = None, python_version: str | None = No
 def probe_command(python_version: str = PYTHON_VERSION) -> str:
     """Spell how the probe is started inside a container.
 
-    uv brings the interpreter, so the image decides neither the version nor whether one exists at all.
+    uv resolves the version and downloads one where the image ships no match, so any image runs the probe.
     """
     return f'/uv/uv run --no-project --python {python_version} python /sensor/probe.py'
 
@@ -302,6 +383,62 @@ def container_command(
     ]
 
 
+@cache
+def windows_probe_stage() -> Path:
+    """Lay an interpreter, the package and the probe out in one directory, and hand back its path.
+
+    A Windows container cannot bind-mount the UNC path a repository checked out under WSL lives at, and the
+    base images carry no Python at all. So uv installs one here, beside a copy of the package, and the whole
+    directory is mounted. That the package has no dependencies is what makes a copy enough.
+
+    The probe is laid next to the package it imports: an interpreter puts the directory of the script it runs
+    on `sys.path`, so nothing sets a path here. Measured inside `nanoserver`, where a uv-managed interpreter
+    starts and the probe read a job memory limit through it.
+    """
+    WINDOWS_DOWNLOADS.mkdir(parents=True, exist_ok=True)
+
+    # A directory of its own per run, so a container reads the package as it is now.
+    stage = Path(tempfile.mkdtemp(prefix='cgroups-sensor-e2e-', dir=WINDOWS_DOWNLOADS))
+    # Removed at exit rather than by the next run, which could be a second session with this one mounted into
+    # a container.
+    atexit.register(shutil.rmtree, stage, ignore_errors=True)
+
+    # A Windows container runs as an account of its own, and under process isolation the host's own permissions
+    # decide what it may touch on a bind mount. A temporary directory is inside the user's profile, on a runner
+    # as much as here, and that account matches nothing in the profile's list - so the container starts and
+    # then cannot launch the interpreter, with `Access is denied` out of `CreateProcess`. Granted before
+    # anything is written, so what is written inherits it, and spelled as a SID because the name of that group
+    # is translated.
+    if not command_works(['icacls', str(stage), '/grant', '*S-1-1-0:(OI)(CI)RX']):
+        pytest.fail(f'the account a container runs as cannot be given access to {stage}')
+
+    # Installed aside and moved, so what the container reads is the interpreter and nothing else. uv leaves a
+    # lock file beside it, and a junction for the minor version that points back at a host path.
+    managed = stage / 'managed'
+    if not command_works(
+        ['uv', 'python', 'install', '--install-dir', str(managed), '--no-bin', PYTHON_VERSION],
+        timeout=TIMEOUT_SECONDS,
+    ):
+        pytest.fail(f'uv cannot install Python {PYTHON_VERSION}')
+
+    found = next(managed.glob('cpython-*/python.exe'), None)
+    if found is None:
+        pytest.fail(f'uv reported installing Python {PYTHON_VERSION} and left no interpreter under {managed}')
+
+    # Resolved, because the junction matches that glob as readily as the directory uv really wrote.
+    found.parent.resolve().rename(stage / 'python')
+    shutil.rmtree(managed, ignore_errors=True)
+
+    shutil.copytree(
+        SRC_DIR / 'cgroups_sensor',
+        stage / 'sensor' / 'cgroups_sensor',
+        ignore=shutil.ignore_patterns('__pycache__'),
+    )
+    shutil.copy(PROBE, stage / 'sensor' / 'probe.py')
+
+    return stage
+
+
 def probe_in_container(
     *engine_args: str,
     engine: Engine = DOCKER,
@@ -319,6 +456,23 @@ def probe_in_container(
             command=command,
         )
     )
+
+
+def require_docker() -> None:
+    """Fail the lane where the daemon will not answer, once and by name.
+
+    A lane says what it needs, and a missing tool fails it rather than quietly testing less.
+
+    Not hypothetical on Windows: a runner boots from a saved image, and the Docker service sometimes does not
+    come up with it - actions/runner-images#13729.
+    """
+    try:
+        result = subprocess.run(['docker', 'info'], capture_output=True, text=True, timeout=60, check=False)
+    except (OSError, subprocess.SubprocessError) as error:
+        pytest.fail(f'this lane needs docker and it could not be run: {error}')
+
+    if result.returncode != 0:
+        pytest.fail(f'this lane needs the docker daemon and it did not answer: {result.stderr.strip()[-300:]}')
 
 
 def qualified(image: str, engine: Engine) -> str:
@@ -361,9 +515,30 @@ def machine_cpu_count() -> int:
     """The cores of this machine, counted independently of the package.
 
     Not the `get_machine_cpu_count()` of the package: a test that asks the subject for the expected value
-    proves nothing.
+    proves nothing. On Linux the two really differ - the package reads `/sys/devices/system/cpu/online` and
+    this reads `sysconf`. On Windows both end at `GetActiveProcessorCount`, asked here directly.
     """
+    if sys.platform == 'win32':
+        cores = windows_machine_facts().cores
+        if not cores:
+            # Zero would silently turn every rate and mask this lane computes into a limit of nothing.
+            pytest.fail('this machine does not say how many cores it has')
+
+        return cores
+
     return os.sysconf('SC_NPROCESSORS_ONLN')
+
+
+def in_a_job(python: str) -> bool:
+    """Whether a process started this way comes up inside a Windows job object.
+
+    Asked of a child rather than of this process, because the two need not agree: a job set to let its
+    children break away leaves the test runner inside one and every process it starts outside. What the probe
+    should report follows from what a process started the same way sees.
+    """
+    answer = subprocess.run([python, '-c', JOB_MEMBERSHIP], capture_output=True, text=True, check=True, timeout=60)
+
+    return answer.stdout.strip() == 'True'
 
 
 def is_unified() -> bool:
@@ -403,14 +578,69 @@ def machine_memory_bytes() -> int:
     pytest.fail('/proc/meminfo carries no MemTotal')
 
 
-def notices_about(reading: Reading, metric: str) -> list[str]:
-    """The notices that explain a dropped reading of one metric.
+@dataclass(frozen=True)
+class WindowsMachine:
+    """What this Windows machine says about itself, asked of the kernel rather than of the package."""
 
-    A notice of the other metric is no explanation, so the two are told apart here.
+    memory_bytes: int
+    """The memory the machine holds."""
+
+    commit_limit: int
+    """What every process together may commit, which a page file lifts above `memory_bytes`. The gap is where
+    a job memory limit is enforced while physical memory alone would call it unlimited."""
+
+    cores: int
+    """The active cores, across every processor group."""
+
+
+@cache
+def windows_machine_facts() -> WindowsMachine:
+    """Ask the machine about itself, once, in one child process."""
+    answer = subprocess.run(
+        [sys.executable, '-c', WINDOWS_MACHINE_FACTS], capture_output=True, text=True, check=True, timeout=60
+    )
+    memory, ceiling, cores = (int(number) for number in answer.stdout.split())
+
+    return WindowsMachine(memory_bytes=memory, commit_limit=ceiling, cores=cores)
+
+
+def notices_about(reading: Reading, metric: str) -> list[str]:
+    """Every notice about one metric.
+
+    A notice of the other metric says nothing about this one, so the two are told apart here.
     """
-    prefixes = {'memory': ('memory', 'machine-memory'), 'cpu': ('cpu',)}[metric]
+    prefixes = {'memory': ('memory', 'machine-memory'), 'cpu': ('cpu', 'machine-cpu')}[metric]
 
     return [code for code in reading.notices if code.startswith(prefixes)]
+
+
+def rejections_about(reading: Reading, metric: str) -> list[str]:
+    """The notices that say why a reading of one metric is missing."""
+    return [code for code in notices_about(reading, metric) if code not in INFORMATIONAL_NOTICES]
+
+
+def check_available(reading: Reading) -> None:
+    """Check the room against the limit and the usage, as the mechanism reported all three.
+
+    On the raw numbers rather than the reported ones: the sensor brings the reported pair into range, so only
+    these can still catch a mechanism whose calls disagree. For a cgroup the three come from one walk and the
+    relation is exact. For a job object they come from three calls a moment apart, so the room drifts.
+    """
+    interface = reading.sources['memory']['interface']
+    if reading.raw_memory_limit is None or reading.raw_memory_used is None:
+        # The two are answered together or not at all, so a room without a usage is a mechanism half-read.
+        assert reading.raw_memory_available is None
+        return
+
+    assert reading.raw_memory_available is not None
+    distance = reading.raw_memory_limit - reading.raw_memory_used
+
+    if interface in DERIVED_AVAILABLE:
+        assert reading.raw_memory_available == distance
+    elif interface in MEASURED_AVAILABLE:
+        assert abs(reading.raw_memory_available - distance) <= DRIFT_ALLOWANCE
+    else:
+        pytest.fail(f'{interface} says nothing about how it arrives at the room left, so this lane cannot check it')
 
 
 def check_invariants(reading: Reading) -> None:
@@ -422,20 +652,27 @@ def check_invariants(reading: Reading) -> None:
     assert reading.version
 
     if reading.memory_limit is not None:
-        assert reading.working_set is not None
-        # The probe charged this much to its own cgroup first, so a smaller working set is not this process.
-        assert reading.allocated <= reading.working_set <= reading.memory_limit
+        assert reading.used is not None
+        # The probe charged this much before reading, whichever mechanism counts it, so anything below it
+        # is not the memory of this process.
+        assert reading.allocated <= reading.used <= reading.memory_limit
         assert reading.machine_memory_bytes is not None
-        assert reading.memory_limit < reading.machine_memory_bytes
+        # Against the ceiling rather than the memory of the machine: a job limits commit, and a limit above
+        # physical memory but below the commit limit is enforced and is reported.
+        assert reading.memory_limit_ceiling is not None
+        assert reading.memory_limit < reading.memory_limit_ceiling
+        assert reading.available is not None
+        assert 0 <= reading.available <= reading.memory_limit - reading.used
+        check_available(reading)
     else:
         # Nothing was reported, so either no limit was found or a notice says why it was dropped.
-        assert reading.raw_memory_limit is None or notices_about(reading, 'memory')
+        assert reading.raw_memory_limit is None or rejections_about(reading, 'memory')
 
     if reading.raw_memory_limit is not None:
         # Whatever became of the limit, the level it was read at is one of the levels that were searched.
         assert reading.memory_limit_level in reading.sources['memory']['levels']
-        if reading.raw_memory_working_set is not None:
-            assert 0 <= reading.raw_memory_working_set <= reading.raw_memory_limit
+        if reading.raw_memory_used is not None:
+            assert 0 <= reading.raw_memory_used <= reading.raw_memory_limit
 
     if reading.cpu_limit is not None:
         assert reading.cpu_limit > 0
@@ -452,4 +689,4 @@ def check_invariants(reading: Reading) -> None:
     else:
         assert reading.cpu_used_ratio is None
         raw_cpu = (reading.raw_cpu_quota, reading.raw_cpu_set_size)
-        assert raw_cpu == (None, None) or notices_about(reading, 'cpu')
+        assert raw_cpu == (None, None) or rejections_about(reading, 'cpu')

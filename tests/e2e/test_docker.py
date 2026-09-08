@@ -38,8 +38,8 @@ def test_memory_only() -> None:
 
     check_invariants(reading)
     assert reading.memory_limit == MEMORY_LIMIT
-    assert reading.working_set is not None
-    assert reading.working_set < reading.memory_limit
+    assert reading.used is not None
+    assert reading.used < reading.memory_limit
     assert reading.cpu_limit is None
 
 
@@ -125,7 +125,7 @@ def test_tighter_limit_inside_the_container() -> None:
 
 @pytest.mark.parametrize('image', DISTRO_IMAGES)
 def test_distributions(image: str) -> None:
-    """Reads the same limits on every distribution, including musl, whose `sysconf` once reported the affinity."""
+    """Reads the same limits on every distribution, whichever libc the image carries."""
     pull_image(image)
 
     reading = probe_in_container(

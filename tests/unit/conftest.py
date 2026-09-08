@@ -63,7 +63,7 @@ def _isolated_module_state() -> Iterator[None]:
 
 @pytest.fixture
 def fake_cgroup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Callable[..., Path]:
-    """Return a builder that lays out a fake cgroup filesystem, points the backend at it and returns its root."""
+    """Return a builder that lays out a fake cgroup filesystem, points `_cgroup` at it and returns its root."""
 
     def build(*, mountinfo: str, self_cgroup: str, files: dict[str, str]) -> Path:
         root = tmp_path / 'cgroup'
@@ -89,6 +89,6 @@ def fake_cgroup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Callable[...
 
 @pytest.fixture
 def _no_cgroup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Point the backend at `/proc` files that do not exist, as on a system without cgroups."""
+    """Point `_cgroup` at `/proc` files that do not exist, as on a system without cgroups."""
     monkeypatch.setattr(_cgroup, '_PROC_SELF_MOUNTINFO', tmp_path / 'missing')
     monkeypatch.setattr(_cgroup, '_PROC_SELF_CGROUP', tmp_path / 'missing')

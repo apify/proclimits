@@ -1,181 +1,85 @@
 from __future__ import annotations
 
-import os
 import threading
 import time
 from dataclasses import dataclass
-from enum import Enum
-from pathlib import Path
 
-from . import _cgroup
-from ._cpu_list import count_cpu_list
-
-_PROC_MEMINFO = Path('/proc/meminfo')
-"""Holds the total memory of the machine."""
-
-_SYS_CPU_ONLINE = Path('/sys/devices/system/cpu/online')
-"""Lists the cores of the machine that are online, e.g. `0-3`."""
+from . import _backend
+from ._types import Notice, NoticeCode, RawMemory, Source
 
 _SHORTEST_WINDOW_SECONDS = 0.01
-"""Below this a rate says more about the counter's own resolution than about the load.
-
-The kernel advances the consumed time in steps of a scheduler tick or so. Two readings taken closer together
-than that usually differ by nothing, which would read as an idle process however busy it is.
-"""
+"""Below this a rate says more about the counter's own resolution than about the load."""
 
 
 @dataclass(frozen=True)
 class MemoryBudget:
     """A memory limit that actually restricts this process, with the usage charged against it.
 
-    `available` is what this is for: the memory this process can still allocate. That is the number to size a
-    budget from, and the one this pair is built to keep exact.
+    `available` is what this is for: the memory this process can still allocate, and the number to size a
+    budget from.
 
-    The other two describe the cgroup the limit was found at, which is not always the cgroup of this process -
-    a limit on a slice or a pod restricts everything under it. Where that happens, `working_set` counts the
-    memory of everything under that level and `used_ratio` is its share, not this process's.
-    `describe().memory_limit_level` names the level, and `available` stays the honest answer either way: the
-    room left there is the room left here.
+    The limit can belong to a level above this process - a slice, a pod, an enclosing job. Everything under
+    that level is charged against it. `used` and `used_ratio` then answer for that level, not for this process.
+    `describe().memory_limit_level` names the level.
     """
 
     limit: int
-    """The tightest limit in bytes. Always below the memory of the machine."""
+    """The tightest limit in bytes. Always below `describe().memory_limit_ceiling`.
 
-    working_set: int
-    """The memory charged against the limit, in bytes. Excludes reclaimable file cache.
-
-    Where several levels hold a limit, this is the smallest distance to one along the chain, moved onto the
-    tightest limit so the pair stays comparable. An out-of-memory kill follows from that distance rather than
-    from a ratio, which is why `available` is the number kept exact.
+    A Windows job limits commit, so that ceiling - and this limit with it - can stand above the memory of the
+    machine. Taking the smaller of this and `machine_memory_bytes` there sizes from a limit that does not
+    apply.
     """
 
-    @property
-    def available(self) -> int:
-        """The memory this process can still allocate before something kills it, in bytes."""
-        return self.limit - self.working_set
+    used: int
+    """The memory charged against the limit, in bytes. What can still be allocated is `available`.
+
+    Which quantity that is belongs to the mechanism. A cgroup counts the memory of the level, inactive file
+    cache off - the figure `docker stats` reports. A job object counts the commit charge of the job.
+
+    Where several cgroup levels hold a limit it is derived, so it matches no single file.
+    `describe().raw_memory_used` says how. Size from `available`.
+    """
+
+    available: int
+    """The memory this process can still allocate before something kills it, in bytes.
+
+    Read from the mechanism, never more than the distance to the limit.
+    `describe().raw_memory_available` keeps the number that was read.
+
+    It answers for the limit rather than for the machine: a host that is itself out of memory can still refuse
+    an allocation this leaves room for.
+    """
 
     @property
     def used_ratio(self) -> float:
         """The share of the limit in use, between 0 and 1.
 
-        Of the limit, not of this process: where the limit belongs to a level above, sibling cgroups are
-        charged against it too.
+        Of the limit, not of this process: where the limit belongs to a level above, everything else under
+        that level is charged against it too.
         """
-        return self.working_set / self.limit if self.limit > 0 else 1.0
+        return self.used / self.limit if self.limit > 0 else 1.0
 
 
 @dataclass(frozen=True)
 class Snapshot:
     """Every reading the sensor takes, taken at once.
 
-    Each reading answers on its own. The CPU counter belongs to the group of this process and the CPU limit
-    can belong to a level above it, so the three are not a set of numbers to combine.
+    Each reading answers on its own. The CPU counter belongs to the closest level that counts any CPU time,
+    and the CPU limit can belong to a level above it, so the three are not a set of numbers to combine.
     """
 
     memory_budget: MemoryBudget | None
-    """The memory budget, or `None` when nothing restricts the memory."""
+    """The memory budget, or `None` where none is reported. `describe()` says why."""
 
     cpu_limit: float | None
-    """The number of usable CPU cores, or `None` when nothing restricts the CPU."""
+    """The number of usable CPU cores, or `None` where none is reported. `describe()` says why."""
 
     cpu_usage: float | None
     """The consumed CPU time in seconds, or `None` when it cannot be read.
 
-    Counted in the group of this process, which need not be the level `cpu_limit` applies to. Dividing one by
-    the other is therefore not a load: `CpuLoad` and `get_cpu_used_ratio()` pair the two properly.
-    """
-
-
-class NoticeCode(str, Enum):
-    """Why a reading was dropped or a rate could not be measured.
-
-    Compare against these rather than against the strings they carry: the strings are what a log line shows,
-    the members are what code should branch on.
-    """
-
-    # Without this a member prints as `NoticeCode.MEMORY_LIMIT_COVERS_MACHINE`, and an f-string of it differs
-    # between the supported Python versions. `StrEnum` would do the same, and arrives only in 3.11.
-    __str__ = str.__str__
-
-    MEMORY_LIMIT_COVERS_MACHINE = 'memory-limit-covers-machine'
-    """The limit is at least the memory of the machine, which is how an unrestricted group spells "no limit"."""
-
-    MEMORY_USAGE_UNAVAILABLE = 'memory-usage-unavailable'
-    """A limit was found, but some level on the chain reports no usage to pair with it."""
-
-    MACHINE_MEMORY_UNKNOWN = 'machine-memory-unknown'
-    """The memory of the machine cannot be read, so a limit cannot be told apart from a sentinel."""
-
-    CPU_QUOTA_COVERS_MACHINE = 'cpu-quota-covers-machine'
-    """The quota is at least the cores of the machine, so it restricts nothing."""
-
-    CPU_SET_COVERS_MACHINE = 'cpu-set-covers-machine'
-    """The set of allowed cores covers every core of the machine, so it restricts nothing."""
-
-    CPU_USAGE_SCOPE_MISMATCH = 'cpu-usage-scope-mismatch'
-    """The level the CPU limit applies to counts no CPU time, so no rate can be measured against it."""
-
-    MEMORY_METRICS_UNAVAILABLE = 'memory-metrics-unavailable'
-    """Nothing here carries a memory limit at all: not Linux, or no cgroup filesystem is mounted."""
-
-    CPU_METRICS_UNAVAILABLE = 'cpu-metrics-unavailable'
-    """Nothing here carries a CPU limit at all: not Linux, or no cgroup filesystem is mounted."""
-
-    MEMORY_LIMIT_UNREADABLE = 'memory-limit-unreadable'
-    """A level holds a memory limit that says nothing usable, so what it enforces is unknown."""
-
-    CPU_LIMIT_UNREADABLE = 'cpu-limit-unreadable'
-    """A level holds a CPU limit that says nothing usable, so what it enforces is unknown."""
-
-    MEMORY_MOUNT_HIDES_ANCESTORS = 'memory-mount-hides-ancestors'
-    """The memory mount exposes part of its hierarchy, so a limit above it is enforced but never read."""
-
-    CPU_MOUNT_HIDES_ANCESTORS = 'cpu-mount-hides-ancestors'
-    """A CPU mount exposes part of its hierarchy, so a limit above it is enforced but never read."""
-
-
-@dataclass(frozen=True)
-class Notice:
-    """One reason a reading was dropped."""
-
-    code: NoticeCode
-    """What happened, as a member of `NoticeCode`. It carries its own string, so an f-string of it, a `%s` in
-    a log line and `json.dumps` all show that string rather than the member."""
-
-    message: str
-    """A human-readable explanation with the values involved."""
-
-
-class Interface(str, Enum):
-    """The mechanism a reading comes from.
-
-    A machine can serve different metrics through different interfaces, so this is reported per metric rather
-    than once. Compare against these members rather than against the strings they carry.
-    """
-
-    # As in `NoticeCode`, so that a member prints as its string on every supported Python version.
-    __str__ = str.__str__
-
-    CGROUP_V2 = 'cgroup-v2'
-    """The unified hierarchy, where one cgroup carries every controller."""
-
-    CGROUP_V1 = 'cgroup-v1'
-    """The older interface, where each controller is a hierarchy of its own."""
-
-
-@dataclass(frozen=True)
-class Source:
-    """Where one metric is read from."""
-
-    interface: Interface
-    """The mechanism providing the metric. It carries its own string, as `Notice.code` does."""
-
-    levels: tuple[str, ...]
-    """The levels the metric is looked for in. The cgroup of this process first, then its ancestors.
-
-    Most of a chain holds no limit, and the whole chain is kept regardless: a limit can be written to any level
-    later, and discovery happens only once. `memory_limit_level` and `cpu_limit_level` name the levels the
-    readings actually came from.
+    Counted at the closest level that counts any. `CpuLoad` and `get_cpu_used_ratio()` are what a rate comes
+    from.
     """
 
 
@@ -184,12 +88,10 @@ class Description:
     """How the sensor arrived at its readings.
 
     This is the diagnostic counterpart of `snapshot()`, and it carries the readings themselves, so that one
-    dump answers what was reported as well as why. When a reading looks wrong, the description shows the
-    mechanism, the levels, the raw values and the rejections.
+    dump answers what was reported as well as why.
 
-    A reading of `None` next to no notice about it means the mechanism was there and nothing limited this
-    process in a way that kills it. Only hard limits are read: `memory.high` throttles reclaim instead, so a
-    cgroup can sit above it indefinitely and nothing here reports it.
+    A limit of `None` next to no notice about it means the mechanism was there and nothing limited this
+    process in a way that kills it. Only hard limits are read.
     """
 
     memory_budget: MemoryBudget | None
@@ -201,35 +103,43 @@ class Description:
     cpu_usage: float | None
     """What `get_cpu_usage()` reports, taken at the same moment as everything below.
 
-    Counted in the group of this process. A rate is measured at `cpu_rate_level` instead, so where that is
-    another level, this counter and a rate that looks wrong do not describe the same scope. That is the first
-    thing to check when they disagree.
+    Counted at the closest level that counts any. A rate is measured at `cpu_rate_level` instead, so where
+    that is another level, this counter and a rate that looks wrong do not describe the same scope. That is
+    the first thing to check when they disagree.
     """
 
     memory_source: Source | None
-    """Where the memory limit and usage are read from. `None` when no mechanism carries them."""
+    """Where the memory limit and usage are read from. `None` where no mechanism is present."""
 
     cpu_quota_source: Source | None
-    """Where the CPU bandwidth quota is read from. `None` when no mechanism carries it."""
+    """Where the CPU bandwidth quota is read from. `None` where no mechanism is present."""
 
     cpu_set_source: Source | None
-    """Where the set of allowed cores is read from. `None` when no mechanism carries it."""
+    """Where the set of allowed cores is read from. `None` where no mechanism is present."""
 
     cpu_usage_source: Source | None
-    """Where the consumed CPU time is read from, as a mechanism and not as a level. `cpu_usage` says which
-    group is counted and `cpu_rate_level` where a rate is measured. `None` when no mechanism carries it."""
+    """Where the consumed CPU time is read from, as a mechanism and not as a level. Which level is counted is
+    under `cpu_usage`, and `cpu_rate_level` names where a rate is measured. `None` where no mechanism is
+    present."""
 
     raw_memory_limit: int | None
     """The tightest memory limit before filtering. Sentinels included."""
 
-    raw_memory_working_set: int | None
+    raw_memory_used: int | None
     """The usage paired with the raw limit, in bytes.
 
-    Unlike the other `raw_` fields this one is computed, not read: `raw_memory_limit - raw_memory_working_set`
-    is the smallest distance to a limit along the chain, moved onto that limit. It matches no single file. The
-    reclaimable file cache comes off `memory.current`, and where several levels are visible the distance comes
-    from whichever level is closest to its own limit. `None` when the tightest level has no usage to pair with
-    it.
+    A cgroup derives it, so it matches no single file: `raw_memory_limit - raw_memory_used` is the
+    smallest distance to a limit along the chain, moved onto that limit, with the inactive file cache
+    already off `memory.current`. A job object reports the memory committed by the job outright. `None` where
+    any level holding a limit did not answer with a usage, or where the mechanism pairs none with a limit of
+    that kind.
+    """
+
+    raw_memory_available: int | None
+    """The room the mechanism reported before filtering, in bytes.
+
+    `MemoryBudget.available` is this number brought within the distance to the limit. Where the two differ,
+    the mechanism answered the three fields from calls taken a moment apart and they disagreed.
     """
 
     raw_cpu_quota: float | None
@@ -241,74 +151,86 @@ class Description:
     memory_limit_level: str | None
     """The level holding `raw_memory_limit`. `None` when no level holds one.
 
-    The tightest limit of the chain wins, which is often not the cgroup of this process. Under Kubernetes it
+    The tightest limit of the chain wins, which is often not the level of this process. Under Kubernetes it
     is regularly the pod, or the `kubepods` slice holding what the node may hand out. The level is named even
     where the filters drop that limit, and a notice then says why.
     """
 
     cpu_limit_level: str | None
-    """The level the reported CPU limit was read at. `None` when nothing restricts the CPU.
+    """The level the reported CPU limit was read at. `None` where no limit is reported, a rejected reading
+    included - unlike `memory_limit_level`, which names its level either way.
 
-    Often not the cgroup of this process: a systemd scope carries no quota of its own and the slice above it
+    Often not the level of this process: a systemd scope carries no quota of its own and the slice above it
     does, and a CPU set on an ancestor restricts everything below it.
     """
 
     cpu_rate_level: str | None
     """The level whose consumed CPU time belongs to that limit, which is where a rate is measured.
 
-    Under cgroup v2 it is `cpu_limit_level` itself. Under cgroup v1 the accounting is a controller of its own
-    and can be mounted elsewhere, so it is the same cgroup under the other mount point. `None` when no level
-    counts that time, and a notice then says so - no rate can be measured at all in that case.
+    Under cgroup v2, and on a job object, it is `cpu_limit_level` itself. Under cgroup v1 the accounting is a
+    controller of its own and can be mounted elsewhere, so it is the same cgroup under the other mount point.
+    `None` where no CPU limit is reported. `None` beside a reported limit means no level counts that time, and
+    a notice then says so. No rate can be measured either way.
     """
 
     machine_memory_bytes: int | None
-    """The machine memory the filters compared against. `None` when it cannot be read."""
+    """The memory of the machine, which is what a pool is sized from where nothing restricts this process.
+    `None` when it cannot be read."""
+
+    memory_limit_ceiling: int | None
+    """The size the memory filter compared the limit against. `None` when it cannot be read.
+
+    A limit at or above this restricts nothing and is dropped. It equals `machine_memory_bytes` where the
+    mechanism limits the memory of the machine, as a cgroup does, and can stand above it where the mechanism
+    limits something the page file enlarges, as a Windows job does.
+    """
 
     machine_cpu_count: int | None
     """The machine core count the filters compared against. `None` when it cannot be read."""
 
     notices: tuple[Notice, ...]
-    """Why readings were rejected. Empty when every reading passed."""
+    """What is worth knowing about a reading, or about the mechanism. Empty when there is nothing to say."""
 
 
 def get_memory_budget() -> MemoryBudget | None:
     """Get the memory budget that actually restricts this process.
 
-    A limit that covers the whole machine is not reported. That is how an unrestricted group spells "no limit".
-    A limit is also not reported when the machine memory is unknown, or when no usage metric can be paired with
-    it. `describe()` explains every rejection.
+    A limit that reaches the ceiling the mechanism judges it against is not reported. That is how an
+    unrestricted group spells "no limit". A limit is also not reported when that ceiling cannot be read, or
+    when no usage metric can be paired with it. `describe()` explains every rejection, and carries the ceiling
+    as `memory_limit_ceiling`.
 
     Returns:
-        The budget, or `None` when nothing restricts the memory of this process.
+        The budget, or `None` where none is reported.
     """
-    return _evaluate_memory(get_machine_memory_bytes()).effective
+    return _evaluate_memory(_backend.memory_limit_ceiling()).effective
 
 
 def get_cpu_limit() -> float | None:
     """Get the number of CPU cores this process may actually use.
 
     A bandwidth quota and a CPU set restrict the CPU independently. The tighter one wins. A reading that covers
-    the whole machine is ignored. Process affinity (`taskset`) is out of scope - it narrows one process, not its
-    group. `describe()` shows the readings separately.
+    the whole machine is ignored. Process affinity (`taskset`, `SetProcessAffinityMask`) is out of scope - it
+    narrows one process, not its group. `describe()` shows the readings separately.
 
     Returns:
-        The number of cores, possibly fractional. `None` when nothing restricts the CPU of this process.
+        The number of cores, possibly fractional. `None` where no limit is reported.
     """
     return _evaluate_cpu_limit(get_machine_cpu_count()).effective
 
 
 def get_cpu_usage() -> float | None:
-    """Get the CPU time this process's group has consumed, in seconds.
+    """Get the CPU time consumed at the level this process is counted in, in seconds.
 
-    The value is a counter that only grows, read in the group of this process. Use it to see how much CPU time
-    has been spent - not to compute a load: `get_cpu_limit()` can come from a level above this process, and
-    dividing this counter by that limit compares two different scopes. `CpuLoad` and `get_cpu_used_ratio()`
-    pair both correctly, and they are what a rate should come from.
+    The value is a counter that only grows, read at the closest level that counts any. Use it to see how much
+    CPU time has been spent - not to compute a load: `get_cpu_limit()` can come from a level above this
+    process, and dividing this counter by that limit compares two different scopes. `CpuLoad` and
+    `get_cpu_used_ratio()` pair both correctly, and they are what a rate should come from.
 
     Returns:
         The cumulative CPU time. `None` when it cannot be read.
     """
-    return _cgroup.read_cpu_usage()
+    return _backend.read_cpu_usage()
 
 
 def get_cpu_used_ratio(interval: float = 1.0) -> float | None:
@@ -317,24 +239,18 @@ def get_cpu_used_ratio(interval: float = 1.0) -> float | None:
     Blocks the calling thread while measuring, but only while measuring: where there is nothing to measure it
     returns at once, so a loop around it has to pace itself. In asyncio code use `get_cpu_used_ratio_async()`.
 
-    The kernel updates the counter in coarse steps, so a short window is noisy: a tenth of a second can report
-    an idle process as busy or a busy one as idle. The default is long enough for that to average out. When
-    sampling repeatedly, use `CpuLoad` instead - it measures across the time between calls and waits for
-    nothing.
+    A short window is noisy, and the default is long enough for that to average out. When sampling repeatedly,
+    use `CpuLoad` instead - it measures across the time between calls and waits for nothing.
 
     Args:
-        interval: How long to measure, in seconds. A tenth of a second is already noisy, and anything below
-            0.01 is refused: the counter does not move that fast, so such a window can only report nothing.
+        interval: How long to measure, in seconds. Below 0.01 it is refused.
 
     Returns:
-        The ratio between 0 and 1. `None` when nothing restricts the CPU, when the counter cannot be read, or
+        The ratio between 0 and 1. `None` where no limit is reported, when the counter cannot be read, or
         when the limit changed while measuring, in value or in level.
 
     Raises:
-        ValueError: If `interval` is shorter than a measurable window. An argument is the caller's to get
-            right, so it is refused rather than answered with `None`. `CpuLoad.sample()` returns `None` for a
-            window that turned out too short, because there the window is what happened, not what was asked
-            for.
+        ValueError: If `interval` is shorter than a measurable window.
     """
     _check_interval(interval)
 
@@ -353,14 +269,13 @@ async def get_cpu_used_ratio_async(interval: float = 1.0) -> float | None:
     """Measure the CPU usage relative to the cores this process may use.
 
     The asyncio variant of `get_cpu_used_ratio()`. Waits with `asyncio.sleep`, so the event loop stays free.
-    It waits only while measuring: where there is nothing to measure it returns at once, so a loop around it
-    has to pace itself, or it spins. The same accuracy applies, and `CpuLoad` avoids the wait entirely.
+    Everything `get_cpu_used_ratio()` says about pacing a loop and about accuracy holds here.
 
     Args:
         interval: How long to measure, in seconds. The same floor of 0.01 applies.
 
     Returns:
-        The ratio between 0 and 1. `None` when nothing restricts the CPU, when the counter cannot be read, or
+        The ratio between 0 and 1. `None` where no limit is reported, when the counter cannot be read, or
         when the limit changed while measuring, in value or in level.
 
     Raises:
@@ -368,7 +283,7 @@ async def get_cpu_used_ratio_async(interval: float = 1.0) -> float | None:
     """
     _check_interval(interval)
 
-    # Imported here: it costs a third of what this package costs to import, and only this one call needs it.
+    # Imported here: it costs about as much as the rest of this package, and only this one call needs it.
     import asyncio  # noqa: PLC0415
 
     start = _read_cpu()
@@ -399,73 +314,56 @@ def snapshot() -> Snapshot:
 def describe() -> Description:
     """Explain how the sensor arrives at its readings.
 
-    Every control file is read again, so a limit changed between two calls shows up here. Where those files
-    are was discovered once - `clear_cache()` is what forgets that.
+    Every reading is taken again, so a limit changed between two calls shows up here. Where the readings come
+    from was discovered once - `clear_cache()` is what forgets that.
 
     Returns:
         The readings, the source of each metric, the raw values before filtering, the machine facts, and a
-        notice for every reading that is not there.
+        notice for whatever is worth knowing about them.
     """
-    controllers = _cgroup.locate_controllers()
+    sources = _backend.sources()
 
-    # One read of the machine facts for both the report and the filtering. They cannot disagree this way.
+    # One read of each filtering fact, here and in the report, so what decided a rejection is the number
+    # reported beside it.
     machine_memory = get_machine_memory_bytes()
     machine_cpus = get_machine_cpu_count()
-    memory = _evaluate_memory(machine_memory)
+    ceiling = _backend.memory_limit_ceiling()
+    memory = _evaluate_memory(ceiling)
     cpu = _evaluate_cpu_limit(machine_cpus)
 
     return Description(
         memory_budget=memory.effective,
         cpu_limit=cpu.effective,
         cpu_usage=get_cpu_usage(),
-        memory_source=_source(controllers.memory),
-        cpu_quota_source=_source(controllers.cpu_quota),
-        cpu_set_source=_source(controllers.cpu_set),
-        cpu_usage_source=_source(controllers.cpu_usage),
+        memory_source=sources.memory,
+        cpu_quota_source=sources.cpu_quota,
+        cpu_set_source=sources.cpu_set,
+        cpu_usage_source=sources.cpu_usage,
         raw_memory_limit=memory.raw.limit,
-        raw_memory_working_set=memory.raw.working_set,
+        raw_memory_used=memory.raw.used,
+        raw_memory_available=memory.raw.available,
         raw_cpu_quota=cpu.raw_quota,
         raw_cpu_set_size=cpu.raw_set_size,
-        memory_limit_level=str(memory.raw.limit_directory) if memory.raw.limit_directory is not None else None,
-        cpu_limit_level=str(cpu.limit_directory) if cpu.limit_directory is not None else None,
-        cpu_rate_level=str(cpu.usage_directory) if cpu.usage_directory is not None else None,
+        memory_limit_level=memory.raw.limit_level,
+        cpu_limit_level=cpu.limit_level,
+        cpu_rate_level=cpu.usage_level,
         machine_memory_bytes=machine_memory,
+        memory_limit_ceiling=ceiling,
         machine_cpu_count=machine_cpus,
-        notices=memory.notices + cpu.notices + _hidden_ancestor_notices(controllers),
-    )
-
-
-def _hidden_ancestor_notices(controllers: _cgroup.Controllers) -> tuple[Notice, ...]:
-    """Name the mounts that expose a subtree, per metric reading through them.
-
-    A metric is named separately because the two can be read through different mounts, and only one of them
-    may be truncated.
-    """
-    cpu = (controllers.cpu_quota, controllers.cpu_set, controllers.cpu_usage)
-
-    return _truncated_mounts(NoticeCode.MEMORY_MOUNT_HIDES_ANCESTORS, (controllers.memory,)) + _truncated_mounts(
-        NoticeCode.CPU_MOUNT_HIDES_ANCESTORS, cpu
-    )
-
-
-def _truncated_mounts(code: NoticeCode, located: tuple[_cgroup.Controller | None, ...]) -> tuple[Notice, ...]:
-    """One notice per mount among these controllers that covers only part of its hierarchy."""
-    # The last directory is the mount point, where the walk had to stop. The root says how much it covers.
-    truncated = {(str(c.dirs[-1]), c.mount_root) for c in located if c is not None and c.mount_root != '/'}
-
-    return tuple(
-        Notice(code=code, message=f'{point} exposes only {root}, so a limit above it is enforced but unreadable')
-        for point, root in sorted(truncated)
+        notices=memory.notices + cpu.notices + _backend.mechanism_notices(),
     )
 
 
 def clear_cache() -> None:
     """Forget the discovered metric sources.
 
-    Discovery is cached for the lifetime of the process. Call this after the process was moved into another
-    group. The next reading then locates the sources again.
+    Where a mechanism has anything to discover, it is discovered once and kept. Call this after the process
+    was moved into another group, and the next reading locates the sources again.
+
+    A child of `fork` clears it on its own, so a pre-fork server whose supervisor puts each worker into a
+    group of its own needs no call here.
     """
-    _cgroup.clear_cache()
+    _backend.clear_cache()
 
 
 @dataclass(frozen=True)
@@ -473,33 +371,38 @@ class _CpuReading:
     """One reading of the CPU counter, with what it has to be compared against."""
 
     limit: float
+    """The cores allowed when the counter was read. A limit that moves between two readings voids the pair."""
+
     usage: float
+    """The counter as it stood, in seconds."""
+
     taken_at: float
-    usage_directory: Path | None
+    """When it was read, on the monotonic clock."""
+
+    usage_level: str | None
     """The level the counter was read at, so a later reading can tell that the limit moved."""
 
 
 def _check_interval(interval: float) -> None:
-    """Reject a measurement window the counter cannot resolve.
+    """Reject a measurement window too short to report a load.
 
     Raises:
-        ValueError: If `interval` is shorter than a measurable window. The public callers document it.
+        ValueError: If `interval` is shorter than a measurable window.
     """
-    # Anything shorter would sleep and then report nothing, because the counter has not moved yet.
     if interval < _SHORTEST_WINDOW_SECONDS:
         raise ValueError(
             f'interval must be at least {_SHORTEST_WINDOW_SECONDS} seconds, got {interval}. '
-            'The kernel advances the consumed time in coarser steps than that.'
+            'A window that short reports noise rather than a load.'
         )
 
 
 def _read_cpu() -> _CpuReading | None:
     """Read the CPU limit and the consumed time at the level that limit binds at."""
     evaluation = _evaluate_cpu_limit(get_machine_cpu_count())
-    if evaluation.effective is None or evaluation.usage_directory is None:
+    if evaluation.effective is None or evaluation.usage_level is None:
         return None
 
-    usage = _cgroup.read_cpu_usage(evaluation.usage_directory)
+    usage = _backend.read_cpu_usage(evaluation.usage_level)
     if usage is None:
         return None
 
@@ -507,7 +410,7 @@ def _read_cpu() -> _CpuReading | None:
         limit=evaluation.effective,
         usage=usage,
         taken_at=time.monotonic(),
-        usage_directory=evaluation.usage_directory,
+        usage_level=evaluation.usage_level,
     )
 
 
@@ -515,7 +418,7 @@ def _used_ratio(start: _CpuReading, end: _CpuReading) -> float | None:
     """Turn two readings into the share of the allowed cores that was used between them."""
     # A limit that moved level, or changed in place, makes the two readings incomparable: the counters then
     # belong to two scopes, or the same consumption divides by two different numbers.
-    if end.usage_directory != start.usage_directory or end.limit != start.limit:
+    if end.usage_level != start.usage_level or end.limit != start.limit:
         return None
 
     elapsed = end.taken_at - start.taken_at
@@ -531,16 +434,14 @@ def _used_ratio(start: _CpuReading, end: _CpuReading) -> float | None:
 class CpuLoad:
     """Measures the CPU load between calls, without blocking.
 
-    A cgroup reports consumed CPU time as a counter, so a rate needs two readings. This keeps the previous one
-    and measures against it, which makes the window as long as the interval between calls. That is what makes
-    it accurate: a short window is dominated by how coarsely the kernel updates the counter, and a sampler
-    called every few seconds does not pay for that.
+    Consumed CPU time is reported as a counter, so a rate needs two readings. This keeps the previous one and
+    measures against it, so the window is as long as the interval between calls. Pacing those calls is the
+    caller's job.
 
     Give each caller a sampler of its own. Two callers sharing one measure each other's windows, and a window
     of nearly no time reports nothing at all.
 
-    Safe to call from several threads, which is what makes the sampling of a worker thread safe next to a
-    `clear_cache()` elsewhere.
+    Safe to call from several threads.
     """
 
     def __init__(self) -> None:
@@ -551,9 +452,9 @@ class CpuLoad:
         """Measure the load since the previous call.
 
         Returns:
-            The ratio between 0 and 1. `None` on the first call, when nothing restricts the CPU, when the
-            counter cannot be read, when the limit changed since the previous call, or when that call was too
-            recent for the counter to have moved.
+            The ratio between 0 and 1. `None` on the first call, where no limit is reported, when the counter
+            cannot be read, when the limit changed since the previous call, or when that call was too recent
+            for the counter to have moved.
         """
         reading = _read_cpu()
 
@@ -571,8 +472,13 @@ class _MemoryEvaluation:
     """The memory reading with the judgement applied."""
 
     effective: MemoryBudget | None
-    raw: _cgroup.RawMemory
+    """The budget to report, or `None` where there is none to report."""
+
+    raw: RawMemory
+    """What the backend said, kept whichever way the judgement went."""
+
     notices: tuple[Notice, ...]
+    """What is worth knowing about a reading, or about the mechanism. Empty when there is nothing to say."""
 
 
 _COVERS_MACHINE_MESSAGES = {
@@ -581,21 +487,13 @@ _COVERS_MACHINE_MESSAGES = {
     NoticeCode.CPU_SET_COVERS_MACHINE: 'The set of {cores} allowed cores covers every core of the machine '
     '({machine_cpus}), so it does not restrict this process.',
 }
-"""How each CPU reading explains itself away where it covers the machine.
-
-Kept apart from the reading so that the sentence is built only for a reading that is dropped. `CpuLoad.sample()`
-evaluates the CPU limit on every call, and nothing there ever reads these.
-"""
+"""How each CPU reading explains itself away where it covers the machine."""
 
 
 def _spell_cores(cores: float) -> str:
-    """Spell a number of cores for a message.
-
-    A quota can allow half a core, so the number is a float throughout. A whole number of them is not written
-    as a fraction: a set of cores has no fractional size at all, and "64.0 allowed cores" reads as a bug.
-    """
+    """Spell a number of cores for a message."""
     # Not `float.is_integer()`: an `int` satisfies this annotation, and only Python 3.12 gives `int` that
-    # method. The remainder answers for both, and for a value no arithmetic here can produce anyway.
+    # method. The remainder answers for both, and a whole number must not print as `64.0 allowed cores`.
     return str(int(cores)) if cores % 1 == 0 else str(cores)
 
 
@@ -604,13 +502,16 @@ class _CpuRestriction:
     """One CPU restriction as read, with the notice that explains it away where it covers the machine."""
 
     cores: float
-    limit_directory: Path
+    """The cores this restriction allows, possibly fractional."""
+
+    limit_level: str
     """The level this restriction was read at."""
 
-    usage_directory: Path | None
+    usage_level: str | None
     """Where the CPU time this restriction applies to is counted. `None` when nothing counts it."""
 
     code: NoticeCode
+    """The notice to raise where this restriction turns out to cover the machine."""
 
 
 @dataclass(frozen=True)
@@ -618,114 +519,136 @@ class _CpuEvaluation:
     """The CPU readings with the judgement applied."""
 
     effective: float | None
-    limit_directory: Path | None
-    """The level `effective` was read at. `None` when nothing restricts the CPU."""
+    """The tighter of the two restrictions in cores. `None` where no limit is reported."""
 
-    usage_directory: Path | None
+    limit_level: str | None
+    """The level `effective` was read at. `None` where no limit is reported."""
+
+    usage_level: str | None
     """Where the consumed CPU time has to be read to match `effective`.
 
-    `None` when no level counts the time this limit applies to, and therefore no rate can be measured. It is
-    never a stand-in for the group of this process: that group is named like any other.
+    `None` when no level counts the time this limit applies to, and therefore no rate can be measured.
     """
 
     raw_quota: float | None
+    """The bandwidth quota in cores before filtering. `None` where there is none to report."""
+
     raw_set_size: int | None
+    """The number of allowed cores before filtering. `None` where there is none to report."""
+
     notices: tuple[Notice, ...]
+    """What is worth knowing about a reading, or about the mechanism. Empty when there is nothing to say."""
 
 
-def _evaluate_memory(machine_memory: int | None) -> _MemoryEvaluation:
-    """Judge the raw memory reading."""
-    raw = _cgroup.read_memory()
-    rejection = _memory_rejection(raw, machine_memory)
+def _evaluate_memory(ceiling: int | None) -> _MemoryEvaluation:
+    """Judge the raw memory reading against the size at which a limit stops restricting."""
+    raw = _backend.read_memory()
+    rejection = _memory_rejection(raw, ceiling)
 
     if rejection is not None:
         return _MemoryEvaluation(effective=None, raw=raw, notices=(rejection,))
 
-    if raw.limit is None or raw.working_set is None:
+    if raw.limit is None or raw.used is None or raw.available is None:
         # Nothing to report and nothing to explain: the mechanism is there and no level limits anything. The
-        # second test cannot be true here - `_memory_rejection` has already answered for it - and it stays
-        # because it is what narrows the type below.
+        # last two tests never decide this branch, and stay only to narrow the type below.
         return _MemoryEvaluation(effective=None, raw=raw, notices=())
 
-    return _MemoryEvaluation(effective=MemoryBudget(limit=raw.limit, working_set=raw.working_set), raw=raw, notices=())
+    return _MemoryEvaluation(effective=_reconcile(raw.limit, raw.used, raw.available), raw=raw, notices=())
 
 
-def _memory_rejection(raw: _cgroup.RawMemory, machine_memory: int | None) -> Notice | None:
-    """Say why the raw memory reading cannot be reported. `None` where it can.
+def _reconcile(limit: int, used: int, available: int) -> MemoryBudget:
+    """Bring three numbers a mechanism may have read separately into one pair a consumer can use."""
+    # The memory in use first, so the distance below it is already a number that can be allocated. The room
+    # gives way rather than the usage: one left too high promises memory the kernel will refuse.
+    charged = min(max(used, 0), limit)
 
-    Each rule here drops a limit that would mislead a consumer, and names what was dropped.
-    """
-    if raw.unreadable_directory is not None:
-        # Every level that did answer is looser than the one that did not, so there is nothing safe to report.
+    return MemoryBudget(limit=limit, used=charged, available=min(max(available, 0), limit - charged))
+
+
+def _memory_rejection(raw: RawMemory, ceiling: int | None) -> Notice | None:
+    """Say why the raw memory reading cannot be reported. `None` where it can."""
+    if raw.unreadable_level is not None:
         return Notice(
             code=NoticeCode.MEMORY_LIMIT_UNREADABLE,
-            message=f'The memory limit of {raw.unreadable_directory} cannot be read, so a tighter limit than '
+            message=f'The memory limit of {raw.unreadable_level} cannot be read, so a tighter limit than '
             'any this process can see may apply and nothing is reported.',
         )
 
     if raw.limit is None:
         # No limit and no mechanism read the same way from the outside, and only one of them is a fact about
-        # this machine. A consumer that expected a limit needs to know which it is looking at.
+        # this machine.
         return (
             Notice(
                 code=NoticeCode.MEMORY_METRICS_UNAVAILABLE,
-                message='No mechanism here carries a memory limit, so nothing was read. This is what a '
-                'machine without cgroups looks like.',
+                message='No mechanism here carries a memory limit, so nothing was read. A Linux machine with '
+                'no cgroup filesystem mounted looks like this, and so does a platform with no backend here.',
             )
-            if _cgroup.locate_controllers().memory is None
+            if _backend.sources().memory is None
             else None
         )
 
-    if machine_memory is None:
-        # Without the machine memory, a real limit and a v1 "unlimited" sentinel look the same.
+    if ceiling is None:
         return Notice(
             code=NoticeCode.MACHINE_MEMORY_UNKNOWN,
-            message=f'The memory of the machine cannot be read, so the limit of {raw.limit} bytes cannot be '
-            'told apart from an "unlimited" sentinel and is not reported.',
+            message=f'The size a memory limit is judged against cannot be read, so the limit of {raw.limit} '
+            'bytes cannot be told apart from an "unlimited" sentinel and is not reported.',
         )
 
-    if raw.limit >= machine_memory:
-        # This is how an unrestricted group spells "no limit". The exact sentinel differs between runtimes.
+    if raw.limit >= ceiling:
+        # The exact sentinel differs between runtimes.
         return Notice(
             code=NoticeCode.MEMORY_LIMIT_COVERS_MACHINE,
-            message=f'The memory limit of {raw.limit} bytes is at least the memory of the machine '
-            f'({machine_memory} bytes), so it does not restrict this process.',
+            message=f'The memory limit of {raw.limit} bytes is at least everything this machine can hand out '
+            f'({ceiling} bytes), so it does not restrict this process.',
         )
 
-    if raw.working_set is None:
-        return Notice(
-            code=NoticeCode.MEMORY_USAGE_UNAVAILABLE,
-            message=f'Found a memory limit of {raw.limit} bytes but no usage metric to pair it with, so the '
-            'limit is not reported.',
-        )
+    if raw.used is None or raw.available is None:
+        return _unpaired_limit_notice(raw.limit, raw.usage_unreadable_level)
 
     return None
 
 
+def _unpaired_limit_notice(limit: int, usage_unreadable_level: str | None) -> Notice:
+    """Say why a limit was found with no usage to pair against it, which happens two ways."""
+    if usage_unreadable_level is not None:
+        return Notice(
+            code=NoticeCode.MEMORY_USAGE_UNREADABLE,
+            message=f'Found a memory limit of {limit} bytes, and {usage_unreadable_level} did not say how '
+            'much of it is in use, so the limit is not reported.',
+        )
+
+    return Notice(
+        code=NoticeCode.MEMORY_USAGE_UNAVAILABLE,
+        message=f'Found a memory limit of {limit} bytes that this mechanism pairs no usage metric with, so '
+        'the limit is not reported.',
+    )
+
+
 def _evaluate_cpu_limit(machine_cpus: int | None) -> _CpuEvaluation:
-    """Judge the raw CPU readings. The tighter of the quota and the set wins.
+    """Judge the raw CPU readings. The tighter of the quota and the set wins."""
+    raw = _backend.read_cpu()
 
-    A reading is trusted when the machine core count is unknown. CPU has no sentinel: an absent quota or set is
-    an absent file, so whatever was read is a number a human configured.
-    """
-    raw = _cgroup.read_cpu()
+    if raw.unreadable_level is not None:
+        # Both readings are already empty here, and this test is before them so that nothing has to rely on
+        # that.
+        return _no_cpu_limit(
+            Notice(
+                code=NoticeCode.CPU_LIMIT_UNREADABLE,
+                message=f'The CPU limit of {raw.unreadable_level} cannot be read, so a tighter limit '
+                'than any this process can see may apply and nothing is reported.',
+            )
+        )
 
-    if raw.unreadable_directory is not None:
-        # As for memory: what that level enforces is unknown, and every level that answered is looser. Both
-        # readings are already empty here, and this is before them so that nothing has to rely on that.
-        return _CpuEvaluation(
-            effective=None,
-            limit_directory=None,
-            usage_directory=None,
-            raw_quota=None,
-            raw_set_size=None,
-            notices=(
-                Notice(
-                    code=NoticeCode.CPU_LIMIT_UNREADABLE,
-                    message=f'The CPU limit of {raw.unreadable_directory} cannot be read, so a tighter limit '
-                    'than any this process can see may apply and nothing is reported.',
-                ),
-            ),
+    if raw.unconvertible_level is not None:
+        # The other reading is dropped with it, for the same reason an unreadable level drops both: the share
+        # that cannot be sized may be the tighter of the two.
+        return _no_cpu_limit(
+            Notice(
+                code=NoticeCode.MACHINE_CPU_COUNT_UNKNOWN,
+                message=f'The CPU limit of {raw.unconvertible_level} is a share of the machine, and the cores '
+                'of the machine cannot be read. A share says nothing about cores on its own, so nothing is '
+                'reported.',
+            )
         )
 
     quota, cpu_set = raw.quota, raw.cpu_set
@@ -736,8 +659,8 @@ def _evaluate_cpu_limit(machine_cpus: int | None) -> _CpuEvaluation:
         restrictions.append(
             _CpuRestriction(
                 cores=quota.cores,
-                limit_directory=quota.limit_directory,
-                usage_directory=quota.usage_directory,
+                limit_level=quota.limit_level,
+                usage_level=quota.usage_level,
                 code=NoticeCode.CPU_QUOTA_COVERS_MACHINE,
             )
         )
@@ -746,8 +669,8 @@ def _evaluate_cpu_limit(machine_cpus: int | None) -> _CpuEvaluation:
         restrictions.append(
             _CpuRestriction(
                 cores=float(cpu_set.cores),
-                limit_directory=cpu_set.limit_directory,
-                usage_directory=cpu_set.usage_directory,
+                limit_level=cpu_set.limit_level,
+                usage_level=cpu_set.usage_level,
                 code=NoticeCode.CPU_SET_COVERS_MACHINE,
             )
         )
@@ -760,13 +683,17 @@ def _evaluate_cpu_limit(machine_cpus: int | None) -> _CpuEvaluation:
         notices.append(
             Notice(
                 code=NoticeCode.CPU_METRICS_UNAVAILABLE,
-                message='No mechanism here carries a CPU limit, so nothing was read. This is what a machine '
-                'without cgroups looks like.',
+                message='No mechanism here carries a CPU limit, so nothing was read. A Linux machine with no '
+                'cgroup filesystem mounted looks like this, and so does a platform with no backend here.',
             )
         )
 
     for restriction in restrictions:
+        # A reading in cores is trusted where the machine core count is unknown: cores have no sentinel, so
+        # whatever was read is a number a human configured.
         if machine_cpus is not None and restriction.cores >= machine_cpus:
+            # Built only where a reading is dropped: `CpuLoad.sample()` evaluates the CPU limit on every call,
+            # and the usual container - a cpuset covering the machine beside a real quota - drops one each time.
             message = _COVERS_MACHINE_MESSAGES[restriction.code]
             notices.append(
                 Notice(
@@ -779,9 +706,8 @@ def _evaluate_cpu_limit(machine_cpus: int | None) -> _CpuEvaluation:
 
     tightest = min(candidates, key=lambda restriction: restriction.cores) if candidates else None
 
-    # A limit whose level counts no CPU time still limits, and is still reported. Only the rate is impossible,
-    # and saying so is the whole point of the notice: the alternative is a ratio taken from another scope.
-    if tightest is not None and tightest.usage_directory is None:
+    # A limit whose level counts no CPU time still limits, and is still reported. Only the rate is impossible.
+    if tightest is not None and tightest.usage_level is None:
         notices.append(
             Notice(
                 code=NoticeCode.CPU_USAGE_SCOPE_MISMATCH,
@@ -792,81 +718,60 @@ def _evaluate_cpu_limit(machine_cpus: int | None) -> _CpuEvaluation:
 
     return _CpuEvaluation(
         effective=tightest.cores if tightest is not None else None,
-        limit_directory=tightest.limit_directory if tightest is not None else None,
-        usage_directory=tightest.usage_directory if tightest is not None else None,
+        limit_level=tightest.limit_level if tightest is not None else None,
+        usage_level=tightest.usage_level if tightest is not None else None,
         raw_quota=quota.cores if quota is not None else None,
         raw_set_size=cpu_set.cores if cpu_set is not None else None,
         notices=tuple(notices),
     )
 
 
-def _no_cpu_mechanism() -> bool:
-    """Whether nothing on this machine carries a CPU limit of either kind."""
-    controllers = _cgroup.locate_controllers()
-
-    return controllers.cpu_quota is None and controllers.cpu_set is None
-
-
-def _source(controller: _cgroup.Controller | None) -> Source | None:
-    """Spell one located controller as a source."""
-    if controller is None:
-        return None
-
-    return Source(
-        interface=Interface.CGROUP_V2 if controller.is_v2 else Interface.CGROUP_V1,
-        levels=tuple(str(directory) for directory in controller.dirs),
+def _no_cpu_limit(notice: Notice) -> _CpuEvaluation:
+    """Report no CPU limit at all, with one notice saying why."""
+    return _CpuEvaluation(
+        effective=None,
+        limit_level=None,
+        usage_level=None,
+        raw_quota=None,
+        raw_set_size=None,
+        notices=(notice,),
     )
+
+
+def _no_cpu_mechanism() -> bool:
+    """Whether no mechanism here could carry a CPU limit of either kind."""
+    sources = _backend.sources()
+
+    return sources.cpu_quota is None and sources.cpu_set is None
 
 
 def get_machine_memory_bytes() -> int | None:
     """Read the total memory of the machine, in bytes.
 
-    This is the number the filters compare a limit against, and it is here so that a consumer that got `None`
-    from `get_memory_budget()` has the other half of the answer without reaching for a second library.
+    This is what a pool is sized from where nothing restricts this process, so a consumer that got `None` from
+    `get_memory_budget()` has the other half of the answer here. A limit is compared against
+    `describe().memory_limit_ceiling` instead.
 
-    Containers normally see `/proc/meminfo` unvirtualized, so this is the memory of the node rather than of the
-    container. A runtime that virtualizes it (lxcfs) makes the limit and the "machine" coincide, and the limit
-    is then reported as no restriction.
+    A runtime that virtualizes this number (lxcfs) makes it equal the limit, which is then reported as no
+    restriction.
 
     Returns:
-        The total memory, or `None` when it cannot be read - which is what happens off Linux.
+        The total memory, or `None` when it cannot be read.
     """
-    try:
-        for line in _PROC_MEMINFO.read_text().splitlines():
-            key, _separator, value = line.partition(':')
-            if key == 'MemTotal':
-                # The value carries a unit, e.g. `8054932 kB`.
-                return int(value.split()[0]) * 1024
-    except (OSError, ValueError, IndexError):
-        return None
-
-    return None
+    return _backend.machine_memory_bytes()
 
 
 def get_machine_cpu_count() -> int | None:
     """Read the number of online CPU cores of the machine.
 
     This is the number the filters compare a quota or a set against, and the reason it is public: the usual
-    answers describe the process instead. `os.cpu_count()` honors the `PYTHON_CPU_COUNT` override, and under
-    musl both it and `psutil.cpu_count()` report the affinity of the process. Either would make a real
-    restriction look like the whole machine. The kernel is asked directly here.
+    answers, `os.cpu_count()` and `psutil.cpu_count()`, can describe the process instead and make a real
+    restriction look like the whole machine. The system is asked first here.
+
+    On Windows this is more than a filter: a job object states its CPU limit as a share of the machine, so
+    without this number that limit cannot be turned into cores at all.
 
     Returns:
         The online cores, or `None` when even the fallbacks say nothing.
     """
-    try:
-        online = _SYS_CPU_ONLINE.read_text().strip()
-    except (OSError, ValueError):
-        return _machine_cpu_count_fallback()
-
-    return count_cpu_list(online) or _machine_cpu_count_fallback()
-
-
-def _machine_cpu_count_fallback() -> int | None:
-    """Count the cores where the kernel does not list them."""
-    try:
-        count = os.sysconf('SC_NPROCESSORS_ONLN')
-    except (AttributeError, OSError, ValueError):
-        return os.cpu_count()
-
-    return count if count > 0 else os.cpu_count()
+    return _backend.machine_cpu_count()
