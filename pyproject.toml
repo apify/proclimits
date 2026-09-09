@@ -52,6 +52,7 @@ dev = [
     "pytest<10.0.0",
     "ruff~=0.16.0",
     "ty>=0.0.77,<0.1.0",
+    "pre-commit<5.0.0",
 ]
 
 [tool.ruff]
@@ -126,12 +127,14 @@ unused-ignore-comment = "error"
 # Run tasks with: uv run poe <task>
 [tool.poe.tasks]
 clean = "rm -rf .pytest_cache .ruff_cache build dist"
-install-dev = "uv sync --group dev --locked"
 build = "uv build --verbose"
 type-check = "uv run ty check"
 unit-tests = "uv run pytest tests/unit"
 e2e-tests = "uv run pytest tests/e2e"
 check-code = ["lint", "type-check", "unit-tests"]
+
+[tool.poe.tasks.install-dev]
+shell = "uv sync --group dev --locked && if git rev-parse --git-dir > /dev/null 2>&1; then uv run pre-commit install; fi"
 
 [tool.poe.tasks.lint]
 shell = "uv run ruff format --check && uv run ruff check"
