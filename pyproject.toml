@@ -143,4 +143,4 @@ shell = "uv run ruff format --check && uv run ruff check"
 shell = "uv run ruff check --fix && uv run ruff format"
 
 [tool.uv.build-backend]
-source-include = ["CHANGELOG.md"]
+source-include = ["CHANGELOG.md", "CONTRIBUTING.md"]
