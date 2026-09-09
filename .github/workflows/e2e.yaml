@@ -121,6 +121,9 @@ jobs:
     name: windows (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
     env:
       UV_PYTHON: '3.13'
       E2E_PLATFORM: win32
