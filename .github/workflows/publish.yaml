@@ -41,12 +41,12 @@ jobs:
     permissions:
       checks: read
     steps:
-      - name: Refuse a release from anywhere but main
-        if: github.ref != 'refs/heads/main'
+      - name: Refuse a release from anywhere but master
+        if: github.ref != 'refs/heads/master'
         env:
           REF_NAME: ${{ github.ref_name }}
         run: |
-          echo "::error::A release runs from main, not from ${REF_NAME}"
+          echo "::error::A release runs from master, not from ${REF_NAME}"
           exit 1
 
       - name: Wait for checks

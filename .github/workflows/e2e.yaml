@@ -3,18 +3,18 @@ name: E2E
 on:
   push:
     branches:
-      - main
+      - master
   pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
 
-# One run per branch. A superseded push is cancelled, except on main, where every commit is checked. The
+# One run per branch. A superseded push is cancelled, except on master, where every commit is checked. The
 # guest lanes boot virtual machines, so a queue of stale runs is expensive.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
 
 jobs:
   # The interpreter is a real axis only for what the probe runs on: the container tests name the version
