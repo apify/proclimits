@@ -1,0 +1,22 @@
+name: PR title
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pr_title_check:
+    name: PR title check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check the pull request title
+        uses: apify/actions/pr-title-check@v1.5.0

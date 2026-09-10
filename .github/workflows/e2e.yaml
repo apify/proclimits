@@ -121,6 +121,9 @@ jobs:
     name: windows (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
     env:
       UV_PYTHON: '3.13'
       E2E_PLATFORM: win32
@@ -228,3 +231,15 @@ jobs:
         env:
           GUEST_PROFILE: ${{ matrix.profile }}
         run: ./tests/e2e/scripts/guest.sh
+
+  checks:
+    name: E2E checks
+    needs: [machine, containers, arm, podman, windows, kubernetes, guest]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      # A skipped lane counts as a failure. No lane is conditional today, so this cannot fire; the day one
+      # gains an `if:`, the release gate must not accept the missing coverage quietly.
+      - name: Fail unless every lane succeeded
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')
+        run: exit 1

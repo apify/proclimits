@@ -1,0 +1,147 @@
+name: Publish
+
+# Releases are cut by hand.
+on:
+  workflow_dispatch:
+    inputs:
+      release_type:
+        description: Release type
+        required: true
+        type: choice
+        default: auto
+        options:
+          - auto
+          - custom
+          - patch
+          - minor
+          - major
+      custom_version:
+        description: The custom version to bump to (only for "custom" type)
+        required: false
+        type: string
+        default: ''
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  DISTRIBUTION_NAME: cgroups-sensor
+  IMPORT_NAME: cgroups_sensor
+
+jobs:
+  wait_for_checks:
+    name: Wait for required checks
+    runs-on: ubuntu-latest
+    # The poll below has no timeout of its own, and it holds the release concurrency group while it waits.
+    timeout-minutes: 90
+    permissions:
+      checks: read
+    steps:
+      - name: Refuse a release from anywhere but main
+        if: github.ref != 'refs/heads/main'
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          echo "::error::A release runs from main, not from ${REF_NAME}"
+          exit 1
+
+      - name: Wait for checks
+        uses: apify/actions/wait-for-checks@v1.5.0
+        with:
+          ref: ${{ github.sha }}
+          check-regexp: '^(CI|E2E) checks$'
+
+  release_prepare:
+    name: Release prepare
+    needs: [wait_for_checks]
+    runs-on: ubuntu-latest
+    outputs:
+      version_number: ${{ steps.release_prepare.outputs.version_number }}
+      tag_name: ${{ steps.release_prepare.outputs.tag_name }}
+      release_notes: ${{ steps.release_prepare.outputs.release_notes }}
+      changelog_artifact_name: ${{ steps.release_prepare.outputs.changelog_artifact_name }}
+    steps:
+      - name: Release prepare
+        id: release_prepare
+        uses: apify/actions/git-cliff-release@v1.5.0
+        with:
+          release_type: ${{ inputs.release_type }}
+          custom_version: ${{ inputs.custom_version }}
+          existing_changelog_path: CHANGELOG.md
+
+  changelog_update:
+    name: Changelog update
+    needs: [release_prepare]
+    permissions:
+      contents: write
+    uses: apify/workflows/.github/workflows/python_bump_and_update_changelog.yaml@main
+    with:
+      version_number: ${{ needs.release_prepare.outputs.version_number }}
+      changelog_artifact_name: ${{ needs.release_prepare.outputs.changelog_artifact_name }}
+    secrets: inherit
+
+  github_release:
+    name: GitHub release
+    needs: [release_prepare, changelog_update]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: GitHub release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          tag_name: ${{ needs.release_prepare.outputs.tag_name }}
+          name: ${{ needs.release_prepare.outputs.version_number }}
+          target_commitish: ${{ needs.changelog_update.outputs.changelog_commitish }}
+          body: ${{ needs.release_prepare.outputs.release_notes }}
+
+  pypi_publish:
+    name: PyPI publish
+    needs: [release_prepare, changelog_update]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # Required for OIDC authentication against PyPI.
+    environment:
+      name: pypi
+      # The only spelling of the name that `env` cannot reach.
+      url: https://pypi.org/project/cgroups-sensor
+    steps:
+      # Builds from the commit the bump landed on, not from the dispatched one, which still carries the
+      # previous version.
+      - name: Prepare distribution
+        uses: apify/actions/prepare-pypi-distribution@v1.5.0
+        with:
+          package_name: ${{ env.DISTRIBUTION_NAME }}
+          is_prerelease: ''
+          version_number: ${{ needs.release_prepare.outputs.version_number }}
+          ref: ${{ needs.changelog_update.outputs.changelog_commitish }}
+
+      # An upload cannot be taken back, so the artifacts are installed into fresh virtualenvs and imported
+      # before they leave the runner.
+      - name: Verify built package
+        uses: apify/actions/python-package-check@v1.5.0
+        with:
+          package_name: ${{ env.IMPORT_NAME }}
+          dist_dir: dist
+          python_version: '3.14'
+          smoke_code: |
+            import ${{ env.IMPORT_NAME }} as package
+
+            assert package.__version__ == '${{ needs.release_prepare.outputs.version_number }}', (
+                f'built {package.__version__}, releasing ${{ needs.release_prepare.outputs.version_number }}'
+            )
+
+            package.snapshot()
+            package.describe()
+            package.get_cpu_limit()
+            package.get_memory_budget()
+
+      - name: Publish package to PyPI
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
