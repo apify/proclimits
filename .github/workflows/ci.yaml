@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+
+permissions:
+  contents: read
+
+# One run per branch. A push that supersedes another cancels it, except on master, where every commit is checked.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+jobs:
+  actions_lint_check:
+    name: Actions lint check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Run actionlint
+        uses: rhysd/actionlint@914e7df21a07ef503a81201c76d2b11c789d3fca # v1.7.12
+
+  # One interpreter for both: ruff takes the target version from its config and ty takes `python-version` from
+  # `[tool.ty.environment]`, so what the runner runs on decides nothing. The unit tests below are where the
+  # interpreter is a real axis.
+  lint_check:
+    name: Lint check
+    uses: apify/workflows/.github/workflows/python_lint_check.yaml@main
+    with:
+      python_versions: '["3.13"]'
+
+  type_check:
+    name: Type check
+    uses: apify/workflows/.github/workflows/python_type_check.yaml@main
+    with:
+      python_versions: '["3.13"]'
+
+  unit_tests:
+    name: Unit tests
+    uses: apify/workflows/.github/workflows/python_unit_tests.yaml@main
+    with:
+      python_versions: '["3.10", "3.11", "3.12", "3.13", "3.14"]'
+      operating_systems: '["ubuntu-latest", "windows-latest"]'
+      run_tests_command: uv run poe unit-tests
+
+  checks:
+    name: CI checks
+    needs: [actions_lint_check, lint_check, type_check, unit_tests]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      # Nothing above is conditional, so a skipped dependency would mean the run never got that far.
+      - name: Fail unless every check succeeded
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')
+        run: exit 1

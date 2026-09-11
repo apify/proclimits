@@ -216,3 +216,5 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+# Analysis material: the bench that validated the implementation, kept out of the module.
+analysis/

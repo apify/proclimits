@@ -1,0 +1,245 @@
+name: E2E
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One run per branch. A superseded push is cancelled, except on master, where every commit is checked. The
+# guest lanes boot virtual machines, so a queue of stale runs is expensive.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+jobs:
+  # The interpreter is a real axis only for what the probe runs on: the container tests name the version
+  # themselves, and running the lane once per version would repeat identical work five times.
+  machine:
+    name: machine (python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.11', '3.12', '3.13', '3.14']
+    env:
+      # The suite itself, and with it the probe on this machine, runs on the version of the matrix.
+      UV_PYTHON: ${{ matrix.python-version }}
+      E2E_INTERFACE: cgroup-v2
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up uv package manager
+        uses: astral-sh/setup-uv@v10.0.1
+
+      - name: Install dependencies
+        run: uv run poe install-dev
+
+      # This runner is a plain cgroup v2 machine with systemd and passwordless sudo, so every machine test
+      # holds here and none is excluded.
+      - name: Run the machine tests
+        run: uv run pytest tests/e2e/test_machine.py
+
+  containers:
+    name: containers
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      E2E_INTERFACE: cgroup-v2
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up uv package manager
+        uses: astral-sh/setup-uv@v10.0.1
+
+      - name: Install dependencies
+        run: uv run poe install-dev
+
+      - name: Run the container tests
+        run: uv run pytest tests/e2e/test_docker.py
+
+  # One job rather than a second axis on every lane above: what differs here is the machine, not the shape of
+  # a cgroup, and the readings have to come out the same.
+  arm:
+    name: arm64
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    env:
+      E2E_INTERFACE: cgroup-v2
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up uv package manager
+        uses: astral-sh/setup-uv@v10.0.1
+
+      - name: Install dependencies
+        run: uv run poe install-dev
+
+      - name: Run the machine and container tests
+        run: uv run pytest tests/e2e/test_machine.py tests/e2e/test_docker.py
+
+  podman:
+    name: podman
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up uv package manager
+        uses: astral-sh/setup-uv@v10.0.1
+
+      # A rootless container has nowhere to be put without a systemd user manager. Lingering keeps one up for
+      # the whole job, and the two variables are how podman finds it.
+      - name: Start a systemd user manager
+        run: |
+          sudo loginctl enable-linger "$USER"
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus" >> "$GITHUB_ENV"
+
+      - name: Install dependencies
+        run: uv run poe install-dev
+
+      - name: Show what podman will do
+        run: |
+          podman info --format 'cgroups: {{.Host.CgroupsVersion}} via {{.Host.CgroupManager}}'
+
+      # A job is not a login, so this user has no logind session and rootless podman drives cgroups itself
+      # rather than through systemd. Slices mean nothing to it then; the fedora guest covers that shape.
+      - name: Run the podman tests
+        run: uv run pytest tests/e2e/test_podman.py -m 'not systemd_slices'
+
+  windows:
+    name: windows (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      UV_PYTHON: '3.13'
+      E2E_PLATFORM: win32
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            image: mcr.microsoft.com/windows/nanoserver:ltsc2022
+          - os: windows-2025
+            image: mcr.microsoft.com/windows/nanoserver:ltsc2025
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up uv package manager
+        uses: astral-sh/setup-uv@v10.0.1
+
+      - name: Install dependencies
+        run: uv run poe install-dev
+
+      # The tests build the jobs they read, so this step needs no container runtime and no privileges.
+      - name: Run the job object tests
+        run: uv run pytest tests/e2e/test_windows.py
+
+      # The Docker service is sometimes stopped on a Windows runner, and every container then fails on a
+      # missing `//./pipe/docker_engine`. Starting it is the workaround the runner maintainers pinned in
+      # https://github.com/actions/runner-images/issues/13729. `docker info` afterwards pins a failure here
+      # rather than on the tests.
+      - name: Start the Docker service
+        run: |
+          if ((Get-Service docker).Status -ne 'Running') { Start-Service docker }
+          $deadline = (Get-Date).AddMinutes(3)
+          do {
+            docker info *> $null
+            if ($LASTEXITCODE -eq 0) { break }
+            Start-Sleep -Seconds 2
+          } while ((Get-Date) -lt $deadline)
+          docker info --format 'daemon up: {{.OSType}} containers, server {{.ServerVersion}}'
+
+      - name: Run the container tests
+        env:
+          E2E_WINDOWS_IMAGE: ${{ matrix.image }}
+        run: uv run pytest tests/e2e/test_windows_containers.py
+
+  kubernetes:
+    name: kubernetes
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up uv package manager
+        uses: astral-sh/setup-uv@v10.0.1
+
+      - name: Install kind
+        uses: helm/kind-action@v1.14.0
+        with:
+          cluster_name: proclimits-e2e
+
+      - name: Install dependencies
+        run: uv run poe install-dev
+
+      - name: Run the kubernetes tests
+        run: uv run pytest tests/e2e/test_kubernetes.py
+
+  guest:
+    name: guest (${{ matrix.profile }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # The Ubuntu profiles are the only way to reach cgroup v1. The Fedora one runs the same suite on a
+        # second distribution, with a much newer systemd.
+        profile: [ubuntu-v1-hybrid, ubuntu-v1-legacy, fedora-v2]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up uv package manager
+        uses: astral-sh/setup-uv@v10.0.1
+
+      - name: Install QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 cloud-image-utils
+
+      - name: Let this user reach /dev/kvm
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Cache the guest image
+        uses: actions/cache@v4
+        with:
+          # The images only, not the keys and overlays a run creates next to them.
+          path: ~/.cache/proclimits-guest
+          key: guest-images-${{ hashFiles('tests/e2e/scripts/guest.sh') }}
+
+      - name: Run the e2e suite inside the guest
+        env:
+          GUEST_PROFILE: ${{ matrix.profile }}
+        run: ./tests/e2e/scripts/guest.sh
+
+  checks:
+    name: E2E checks
+    needs: [machine, containers, arm, podman, windows, kubernetes, guest]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      # A skipped lane counts as a failure. No lane is conditional today, so this cannot fire; the day one
+      # gains an `if:`, the release gate must not accept the missing coverage quietly.
+      - name: Fail unless every lane succeeded
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')
+        run: exit 1
