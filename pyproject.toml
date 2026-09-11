@@ -43,8 +43,8 @@ dependencies = []
 
 [project.urls]
 "Apify Homepage" = "https://apify.com"
-"Issue Tracker" = "https://github.com/apify/cgroups-sensor/issues"
-"Source Code" = "https://github.com/apify/cgroups-sensor"
+"Issue Tracker" = "https://github.com/apify/proclimits/issues"
+"Source Code" = "https://github.com/apify/proclimits"
 
 [dependency-groups]
 dev = [
