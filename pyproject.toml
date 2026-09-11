@@ -3,7 +3,7 @@ requires = ["uv_build>=0.12.0,<0.13.0"]
 build-backend = "uv_build"
 
 [project]
-name = "cgroups-sensor"
+name = "proclimits"
 version = "0.1.0"
 description = "Resource limits that actually apply to the running process, from cgroups or Windows job objects"
 authors = [
@@ -100,7 +100,7 @@ docstring-quotes = "double"
 inline-quotes = "single"
 
 [tool.ruff.lint.isort]
-known-first-party = ["cgroups_sensor"]
+known-first-party = ["proclimits"]
 
 [tool.pytest.ini_options]
 addopts = "-r a --verbose --strict-markers --strict-config"

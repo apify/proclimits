@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from cgroups_sensor import _cgroup as cgroup
+from proclimits import _cgroup as cgroup
 
 from .conftest import (
     HYBRID_MOUNTINFO,

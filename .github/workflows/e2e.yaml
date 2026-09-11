@@ -183,7 +183,7 @@ jobs:
       - name: Install kind
         uses: helm/kind-action@v1.14.0
         with:
-          cluster_name: cgroups-sensor-e2e
+          cluster_name: proclimits-e2e
 
       - name: Install dependencies
         run: uv run poe install-dev
@@ -224,7 +224,7 @@ jobs:
         uses: actions/cache@v4
         with:
           # The images only, not the keys and overlays a run creates next to them.
-          path: ~/.cache/cgroups-sensor-guest
+          path: ~/.cache/proclimits-guest
           key: guest-images-${{ hashFiles('tests/e2e/scripts/guest.sh') }}
 
       - name: Run the e2e suite inside the guest

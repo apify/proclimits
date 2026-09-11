@@ -3,10 +3,10 @@ set -eu
 
 REPO_ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
 PROFILE=${GUEST_PROFILE:-ubuntu-v1-hybrid}
-WORK=${GUEST_WORK:-/tmp/cgroups-sensor-guest/$PROFILE}
+WORK=${GUEST_WORK:-/tmp/proclimits-guest/$PROFILE}
 # The images are the same bytes on every run, so they live apart from the keys and overlays a run creates -
 # and outside /tmp, which a WSL or machine restart wipes. Re-downloading a gigabyte is the slowest thing here.
-DOWNLOADS=${GUEST_DOWNLOADS:-${XDG_CACHE_HOME:-$HOME/.cache}/cgroups-sensor-guest}
+DOWNLOADS=${GUEST_DOWNLOADS:-${XDG_CACHE_HOME:-$HOME/.cache}/proclimits-guest}
 SSH_PORT=${GUEST_SSH_PORT:-2222}
 GUEST_USER=bench
 

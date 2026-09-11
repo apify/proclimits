@@ -11,7 +11,7 @@ import pytest
 pytestmark = pytest.mark.skipif(sys.platform != 'win32', reason='job objects are a Windows mechanism')
 
 if sys.platform == 'win32':
-    from cgroups_sensor import _windows
+    from proclimits import _windows
 
 if TYPE_CHECKING:
     from collections.abc import Callable

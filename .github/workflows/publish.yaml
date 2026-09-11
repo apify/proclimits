@@ -29,8 +29,8 @@ permissions:
   contents: read
 
 env:
-  DISTRIBUTION_NAME: cgroups-sensor
-  IMPORT_NAME: cgroups_sensor
+  DISTRIBUTION_NAME: proclimits
+  IMPORT_NAME: proclimits
 
 jobs:
   wait_for_checks:
@@ -111,7 +111,7 @@ jobs:
     environment:
       name: pypi
       # The only spelling of the name that `env` cannot reach.
-      url: https://pypi.org/project/cgroups-sensor
+      url: https://pypi.org/project/proclimits
     steps:
       # Builds from the commit the bump landed on, not from the dispatched one, which still carries the
       # previous version.

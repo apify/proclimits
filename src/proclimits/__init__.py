@@ -25,7 +25,7 @@ def __getattr__(name: str) -> str:
     from importlib import metadata  # noqa: PLC0415
 
     try:
-        return metadata.version('cgroups-sensor')
+        return metadata.version('proclimits')
     except metadata.PackageNotFoundError:
         # Imported from a source tree nothing installed, which is how the end-to-end tests run it.
         return 'unknown'

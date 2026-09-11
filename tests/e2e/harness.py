@@ -65,10 +65,10 @@ PYTHON_VERSION = '3.13'
 PYTHON_VERSIONS = ('3.10', '3.11', '3.12', '3.13', '3.14')
 """Every interpreter the package supports, as the classifiers list them."""
 
-UV_DOWNLOADS = Path(tempfile.gettempdir()) / 'cgroups-sensor-e2e-uv'
+UV_DOWNLOADS = Path(tempfile.gettempdir()) / 'proclimits-e2e-uv'
 """Where uv and its interpreters are kept, so only the first run pays for the download."""
 
-WINDOWS_DOWNLOADS = Path(tempfile.gettempdir()) / 'cgroups-sensor-e2e-windows'
+WINDOWS_DOWNLOADS = Path(tempfile.gettempdir()) / 'proclimits-e2e-windows'
 """Where each run stages the Windows interpreter and the probe."""
 
 WINDOWS_MOUNT = 'C:\\probe'
@@ -398,7 +398,7 @@ def windows_probe_stage() -> Path:
     WINDOWS_DOWNLOADS.mkdir(parents=True, exist_ok=True)
 
     # A directory of its own per run, so a container reads the package as it is now.
-    stage = Path(tempfile.mkdtemp(prefix='cgroups-sensor-e2e-', dir=WINDOWS_DOWNLOADS))
+    stage = Path(tempfile.mkdtemp(prefix='proclimits-e2e-', dir=WINDOWS_DOWNLOADS))
     # Removed at exit rather than by the next run, which could be a second session with this one mounted into
     # a container.
     atexit.register(shutil.rmtree, stage, ignore_errors=True)
@@ -430,8 +430,8 @@ def windows_probe_stage() -> Path:
     shutil.rmtree(managed, ignore_errors=True)
 
     shutil.copytree(
-        SRC_DIR / 'cgroups_sensor',
-        stage / 'sensor' / 'cgroups_sensor',
+        SRC_DIR / 'proclimits',
+        stage / 'sensor' / 'proclimits',
         ignore=shutil.ignore_patterns('__pycache__'),
     )
     shutil.copy(PROBE, stage / 'sensor' / 'probe.py')

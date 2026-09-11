@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from cgroups_sensor import _cgroup
+from proclimits import _cgroup
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator

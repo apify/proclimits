@@ -1,4 +1,4 @@
-# cgroups-sensor
+# proclimits
 
 Reports the CPU and memory limits that actually apply to the running process. It reads cgroups on Linux and job objects on Windows.
 
@@ -43,7 +43,7 @@ Size a memory budget from the limit, and fall back to the machine when nothing l
 ```python
 import psutil
 
-import cgroups_sensor
+import proclimits
 
 
 def memory_budget() -> tuple[int, int]:
@@ -51,7 +51,7 @@ def memory_budget() -> tuple[int, int]:
 
     For a consumer that sizes a budget from the pair rather than from `MemoryBudget.available`.
     """
-    budget = cgroups_sensor.get_memory_budget()
+    budget = proclimits.get_memory_budget()
     if budget is not None:
         return budget.limit, budget.used
 
@@ -62,9 +62,9 @@ def memory_budget() -> tuple[int, int]:
 Size a worker pool the same way, from the cores you may use:
 
 ```python
-import cgroups_sensor
+import proclimits
 
-cores = cgroups_sensor.get_cpu_limit() or cgroups_sensor.get_machine_cpu_count() or 1
+cores = proclimits.get_cpu_limit() or proclimits.get_machine_cpu_count() or 1
 workers = max(1, round(cores))
 ```
 
@@ -77,9 +77,9 @@ import time
 
 import psutil
 
-import cgroups_sensor
+import proclimits
 
-load = cgroups_sensor.CpuLoad()
+load = proclimits.CpuLoad()
 
 while True:
     used_ratio = load.sample()
@@ -102,12 +102,12 @@ Log what applies when a service starts, so a surprising number can be explained 
 ```python
 import logging
 
-import cgroups_sensor
+import proclimits
 
 logger = logging.getLogger(__name__)
-logger.info(f'resource limits: {cgroups_sensor.snapshot()}')
+logger.info(f'resource limits: {proclimits.snapshot()}')
 
-for notice in cgroups_sensor.describe().notices:
+for notice in proclimits.describe().notices:
     logger.info(f'{notice.code}: {notice.message}')
 ```
 

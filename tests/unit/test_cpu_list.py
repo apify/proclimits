@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from cgroups_sensor._cpu_list import count_cpu_list
+from proclimits._cpu_list import count_cpu_list
 
 
 @pytest.mark.parametrize(

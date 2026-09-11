@@ -64,8 +64,8 @@ def _limited_slice(*properties: str, system: bool) -> Iterator[str]:
     A slice exists only while a unit lives in it, so a sleeping holder keeps it alive.
     """
     suffix = f'{os.getpid()}-{next(_slice_numbers)}'
-    name = f'cgroups-sensor-e2e-{suffix}.slice'
-    holder = f'cgroups-sensor-e2e-holder-{suffix}'
+    name = f'proclimits-e2e-{suffix}.slice'
+    holder = f'proclimits-e2e-holder-{suffix}'
 
     # A system slice needs root. A user one is where a rootless engine puts its containers.
     run_unit = ['sudo', 'systemd-run'] if system else ['systemd-run', '--user']
@@ -117,7 +117,7 @@ def systemd_scope() -> Iterator[Callable[..., list[str]]]:
     units: list[tuple[str, bool]] = []
 
     def build(*properties: str, system: bool = False) -> list[str]:
-        unit = f'cgroups-sensor-e2e-{os.getpid()}-{len(units)}'
+        unit = f'proclimits-e2e-{os.getpid()}-{len(units)}'
         units.append((unit, system))
 
         wrapper = ['sudo'] if system else []

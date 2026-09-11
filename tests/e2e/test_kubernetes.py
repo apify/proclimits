@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 
 pytestmark = [pytest.mark.kubernetes, pytest.mark.usefixtures('_cluster')]
 
-CLUSTER = 'cgroups-sensor-e2e'
+CLUSTER = 'proclimits-e2e'
 POD = 'sensor-probe'
 SRC_MAP = 'sensor-src'
 PROBE_MAP = 'sensor-probe-script'
@@ -80,7 +80,7 @@ def _cluster() -> Iterator[None]:
 
     # The package and the probe travel as config maps, so no image has to be built. The files go in one by
     # one, so only the Python sources travel.
-    sources = sorted((SRC_DIR / 'cgroups_sensor').glob('*.py'))
+    sources = sorted((SRC_DIR / 'proclimits').glob('*.py'))
     kubectl('delete', 'configmap', SRC_MAP, PROBE_MAP, '--ignore-not-found')
     kubectl('create', 'configmap', SRC_MAP, *[f'--from-file={path}' for path in sources])
     kubectl('create', 'configmap', PROBE_MAP, f'--from-file={PROBE}')
@@ -115,7 +115,7 @@ def manifest(resources: dict[str, Any]) -> str:
                         'env': [{'name': 'PYTHONPATH', 'value': '/sensor'}],
                         'resources': resources,
                         'volumeMounts': [
-                            {'name': 'src', 'mountPath': '/sensor/cgroups_sensor'},
+                            {'name': 'src', 'mountPath': '/sensor/proclimits'},
                             {'name': 'probe', 'mountPath': '/probe'},
                         ],
                     }
