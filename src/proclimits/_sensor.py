@@ -15,8 +15,7 @@ _SHORTEST_WINDOW_SECONDS = 0.01
 class MemoryBudget:
     """A memory limit that actually restricts this process, with the usage charged against it.
 
-    `available` is what this is for: the memory this process can still allocate, and the number to size a
-    budget from.
+    `available` is what this is for: the distance to the limit, and the number to size a budget from.
 
     The limit can belong to a level above this process - a slice, a pod, an enclosing job. Everything under
     that level is charged against it. `used` and `used_ratio` then answer for that level, not for this process.
@@ -32,17 +31,22 @@ class MemoryBudget:
     """
 
     used: int
-    """The memory charged against the limit, in bytes. What can still be allocated is `available`.
+    """The memory charged against the limit, in bytes.
 
-    Which quantity that is belongs to the mechanism. A cgroup counts the memory of the level, inactive file
-    cache off - the figure `docker stats` reports. A job object counts the commit charge of the job.
+    Which quantity that is belongs to the mechanism. A cgroup counts the memory of the level less the file cache
+    the kernel can drop. Pages waiting to be written to disk stay counted, so it rises while a process writes.
+    A job object counts the commit charge of the job.
 
     Where several cgroup levels hold a limit it is derived, so it matches no single file.
     `describe().raw_memory_used` says how. Size from `available`.
     """
 
     available: int
-    """The memory this process can still allocate before something kills it, in bytes.
+    """How much more memory the limit leaves room for, in bytes, as the mechanism reports it.
+
+    The number to size a budget from. It is not a promise about the next allocation. A cgroup counts file cache
+    the kernel can drop as free. It falls while a process writes, until the data reaches the disk.
+    `describe().raw_memory_unflushed_cache` shows how much is waiting.
 
     Read from the mechanism, never more than the distance to the limit.
     `describe().raw_memory_available` keeps the number that was read.
@@ -128,11 +132,10 @@ class Description:
     raw_memory_used: int | None
     """The usage paired with the raw limit, in bytes.
 
-    A cgroup derives it, so it matches no single file: `raw_memory_limit - raw_memory_used` is the
-    smallest distance to a limit along the chain, moved onto that limit, with the inactive file cache
-    already off `memory.current`. A job object reports the memory committed by the job outright. `None` where
-    any level holding a limit did not answer with a usage, or where the mechanism pairs none with a limit of
-    that kind.
+    A cgroup derives it, so it matches no single file: `raw_memory_limit - raw_memory_used` is the smallest
+    distance to a limit along the chain, moved onto that limit. Each level counts its charge less the file cache
+    counted as free. A job object reports the memory committed by the job outright. `None` where any level
+    holding a limit did not answer with a usage, or where the mechanism pairs none with a limit of that kind.
     """
 
     raw_memory_available: int | None
@@ -140,6 +143,15 @@ class Description:
 
     `MemoryBudget.available` is this number brought within the distance to the limit. Where the two differ,
     the mechanism answered the three fields from calls taken a moment apart and they disagreed.
+    """
+
+    raw_memory_unflushed_cache: int | None
+    """The pages waiting to be written to disk, in bytes, at the level whose distance set `raw_memory_available`.
+
+    Read from `file_dirty` and `file_writeback` under cgroup v2, `total_dirty` and `total_writeback` under
+    cgroup v1. The writeback count includes anonymous pages on their way to swap. These pages come off the file
+    cache counted as free, down to zero, so they are not the exact amount added to `raw_memory_used`. `None`
+    where the kernel does not report them, where the usage was not read, and under a Windows job.
     """
 
     raw_cpu_quota: float | None
@@ -342,6 +354,7 @@ def describe() -> Description:
         raw_memory_limit=memory.raw.limit,
         raw_memory_used=memory.raw.used,
         raw_memory_available=memory.raw.available,
+        raw_memory_unflushed_cache=memory.raw.unflushed_cache,
         raw_cpu_quota=cpu.raw_quota,
         raw_cpu_set_size=cpu.raw_set_size,
         memory_limit_level=memory.raw.limit_level,

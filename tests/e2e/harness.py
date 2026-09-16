@@ -185,6 +185,7 @@ class Reading:
     raw_memory_limit: int | None
     raw_memory_used: int | None
     raw_memory_available: int | None
+    raw_memory_unflushed_cache: int | None
     raw_cpu_quota: float | None
     raw_cpu_set_size: int | None
     memory_limit_level: str | None
@@ -194,6 +195,11 @@ class Reading:
     memory_limit_ceiling: int | None
     machine_cpu_count: int | None
     allocated: int
+    # Around the probe's write burst. `None` in every lane that does not ask for one.
+    used_before: int | None
+    used_after: int | None
+    unflushed_after: int | None
+    burst_written: int | None
     notices: tuple[str, ...]
     sources: dict[str, Any]
 
@@ -673,6 +679,16 @@ def check_invariants(reading: Reading) -> None:
         assert reading.memory_limit_level in reading.sources['memory']['levels']
         if reading.raw_memory_used is not None:
             assert 0 <= reading.raw_memory_used <= reading.raw_memory_limit
+        else:
+            # The cache is read with the usage, so a level that gave no usage gave no cache either.
+            assert reading.raw_memory_unflushed_cache is None
+    else:
+        # The cache is read only at a level that holds a limit, so no limit means no cache either.
+        assert reading.raw_memory_unflushed_cache is None
+
+    if reading.raw_memory_unflushed_cache is not None:
+        assert reading.raw_memory_unflushed_cache >= 0
+        assert reading.sources['memory']['interface'] in {'cgroup-v1', 'cgroup-v2'}
 
     if reading.cpu_limit is not None:
         assert reading.cpu_limit > 0

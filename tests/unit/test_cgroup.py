@@ -176,6 +176,7 @@ def test_read_hierarchies_no_unified_when_no_mount_covers(fake_cgroup: Callable[
         limit=None,
         used=None,
         available=None,
+        unflushed_cache=None,
         limit_level=None,
         unreadable_level=None,
         usage_unreadable_level=None,
@@ -202,6 +203,7 @@ def test_read_hierarchies_v1_answers_when_no_cgroup2_mount_covers(fake_cgroup: C
         limit=536870912,
         used=600,
         available=536870312,
+        unflushed_cache=None,
         limit_level=str(root / 'memory'),
         unreadable_level=None,
         usage_unreadable_level=None,
@@ -402,6 +404,7 @@ def test_read_memory_tightest_level(fake_cgroup: Callable[..., Path]) -> None:
         limit=1000,
         used=100,
         available=900,
+        unflushed_cache=None,
         limit_level=str(root / 'kubepods' / 'pod' / 'container'),
         unreadable_level=None,
         usage_unreadable_level=None,
@@ -432,6 +435,7 @@ def test_read_memory_when_the_tightest_limit_is_not_the_closest(fake_cgroup: Cal
         limit=500,
         used=450,
         available=50,
+        unflushed_cache=None,
         limit_level=str(root / 'pod' / 'container'),
         unreadable_level=None,
         usage_unreadable_level=None,
@@ -460,6 +464,7 @@ def test_read_memory_tighter_ancestor(fake_cgroup: Callable[..., Path]) -> None:
         limit=500,
         used=450,
         available=50,
+        unflushed_cache=None,
         limit_level=str(root / 'kubepods'),
         unreadable_level=None,
         usage_unreadable_level=None,
@@ -488,6 +493,7 @@ def test_read_memory_smallest_distance(fake_cgroup: Callable[..., Path]) -> None
         limit=100,
         used=80,
         available=20,
+        unflushed_cache=None,
         limit_level=str(root / 'kubepods' / 'pod'),
         unreadable_level=None,
         usage_unreadable_level=None,
@@ -514,6 +520,7 @@ def test_read_memory_partial_level(fake_cgroup: Callable[..., Path]) -> None:
         limit=1000,
         used=None,
         available=None,
+        unflushed_cache=None,
         limit_level=str(root / 'kubepods' / 'pod' / 'container'),
         unreadable_level=None,
         usage_unreadable_level=str(root / 'kubepods' / 'pod' / 'container'),
@@ -569,6 +576,7 @@ def test_read_memory_usage_above_the_limit(fake_cgroup: Callable[..., Path]) -> 
         limit=1000,
         used=1000,
         available=0,
+        unflushed_cache=None,
         limit_level=str(root),
         unreadable_level=None,
         usage_unreadable_level=None,
@@ -598,6 +606,7 @@ def test_read_memory_ancestor_without_usage_files(fake_cgroup: Callable[..., Pat
         limit=500,
         used=None,
         available=None,
+        unflushed_cache=None,
         limit_level=str(root / 'pod'),
         unreadable_level=None,
         usage_unreadable_level=str(root / 'pod'),
@@ -616,6 +625,7 @@ def test_read_memory_no_used(fake_cgroup: Callable[..., Path]) -> None:
         limit=536870912,
         used=None,
         available=None,
+        unflushed_cache=None,
         limit_level=str(root),
         unreadable_level=None,
         usage_unreadable_level=str(root),
@@ -640,6 +650,7 @@ def test_read_memory_missing_files(fake_cgroup: Callable[..., Path]) -> None:
         limit=268435456,
         used=600,
         available=268434856,
+        unflushed_cache=None,
         limit_level=str(root / 'pod'),
         unreadable_level=None,
         usage_unreadable_level=None,
@@ -955,6 +966,7 @@ def test_read_memory_unreadable_limit(fake_cgroup: Callable[..., Path]) -> None:
         limit=None,
         used=None,
         available=None,
+        unflushed_cache=None,
         limit_level=None,
         unreadable_level=str(root / 'pod' / 'container'),
         usage_unreadable_level=None,
@@ -982,6 +994,7 @@ def test_read_memory_looser_level_without_usage(fake_cgroup: Callable[..., Path]
         limit=500,
         used=None,
         available=None,
+        unflushed_cache=None,
         limit_level=str(root / 'pod' / 'container'),
         unreadable_level=None,
         usage_unreadable_level=str(root / 'pod'),
@@ -1152,6 +1165,7 @@ def test_locate_controllers_hybrid(fake_cgroup: Callable[..., Path]) -> None:
         limit=536870912,
         used=600,
         available=536870312,
+        unflushed_cache=None,
         limit_level=str(root / 'memory'),
         unreadable_level=None,
         usage_unreadable_level=None,
@@ -1165,6 +1179,7 @@ def test_no_cgroups() -> None:
         limit=None,
         used=None,
         available=None,
+        unflushed_cache=None,
         limit_level=None,
         unreadable_level=None,
         usage_unreadable_level=None,
@@ -1203,6 +1218,7 @@ def test_locate_controllers_with_unreadable_directories(
         limit=None,
         used=None,
         available=None,
+        unflushed_cache=None,
         limit_level=None,
         unreadable_level=None,
         usage_unreadable_level=None,
@@ -1347,6 +1363,7 @@ def test_read_memory_limit_of_zero(fake_cgroup: Callable[..., Path]) -> None:
         limit=0,
         used=0,
         available=0,
+        unflushed_cache=None,
         limit_level=str(root / 'pod' / 'container'),
         unreadable_level=None,
         usage_unreadable_level=None,
@@ -1365,11 +1382,14 @@ def test_read_memory_usage_below_the_cache(fake_cgroup: Callable[..., Path]) -> 
     controller = cgroup.locate_controllers().memory
 
     assert controller is not None
-    assert cgroup._read_working_set(controller, root) == 0
+    usage = cgroup._read_memory_usage(controller, root)
+    assert usage is not None
+    assert usage.charged == 0
     assert cgroup.read_memory() == cgroup.RawMemory(
         limit=1000,
         used=0,
         available=1000,
+        unflushed_cache=None,
         limit_level=str(root),
         unreadable_level=None,
         usage_unreadable_level=None,
@@ -1434,6 +1454,7 @@ def test_read_hierarchies_skips_a_foreign_v1_mount(fake_cgroup: Callable[..., Pa
         limit=2000,
         used=100,
         available=1900,
+        unflushed_cache=None,
         limit_level=str(root / 'ours' / 'mine'),
         unreadable_level=None,
         usage_unreadable_level=None,
@@ -1456,6 +1477,7 @@ def test_read_memory_v1_uses_the_hierarchical_key(fake_cgroup: Callable[..., Pat
         limit=1000,
         used=500,
         available=500,
+        unflushed_cache=None,
         limit_level=str(root / 'memory'),
         unreadable_level=None,
         usage_unreadable_level=None,
@@ -1549,3 +1571,343 @@ def test_read_cpu_quota_appearing_after_discovery(fake_cgroup: Callable[..., Pat
     assert quota is not None
     assert quota.cores == 0.5
     assert quota.limit_level == str(root / 'slice' / 'own')
+
+
+def test_read_memory_dirty_cache_is_not_credited(fake_cgroup: Callable[..., Path]) -> None:
+    """Credits the inactive file cache less the pages waiting to be written."""
+    root = fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/'),
+        files={
+            'memory.max': '1000\n',
+            'memory.current': '900\n',
+            'memory.stat': 'anon 300\ninactive_file 600\nfile_dirty 200\nfile_writeback 100\n',
+        },
+    )
+
+    # 300 of the 600 of inactive cache is waiting, so 300 is credited and 600 stays charged. The working set
+    # alone would be 300.
+    assert cgroup.read_memory() == cgroup.RawMemory(
+        limit=1000,
+        used=600,
+        available=400,
+        unflushed_cache=300,
+        limit_level=str(root),
+        unreadable_level=None,
+        usage_unreadable_level=None,
+    )
+
+
+def test_read_memory_dirty_cache_is_not_credited_v1(fake_cgroup: Callable[..., Path]) -> None:
+    """Reads the hierarchical dirty and writeback keys under cgroup v1."""
+    root = fake_cgroup(
+        mountinfo=V1_MOUNTINFO,
+        self_cgroup=V1_SELF_CGROUP.format(path='/'),
+        files={
+            'memory/memory.limit_in_bytes': '1000\n',
+            'memory/memory.usage_in_bytes': '900\n',
+            # The unprefixed keys carry other values, so reading them would change the result.
+            'memory/memory.stat': (
+                'rss 300\ndirty 10\nwriteback 5\ninactive_file 100\n'
+                'total_inactive_file 600\ntotal_dirty 200\ntotal_writeback 100\n'
+            ),
+        },
+    )
+
+    assert cgroup.read_memory() == cgroup.RawMemory(
+        limit=1000,
+        used=600,
+        available=400,
+        unflushed_cache=300,
+        limit_level=str(root / 'memory'),
+        unreadable_level=None,
+        usage_unreadable_level=None,
+    )
+
+
+def test_read_memory_more_waiting_than_inactive_cache(fake_cgroup: Callable[..., Path]) -> None:
+    """Credits nothing where more is waiting to be written than the inactive cache holds."""
+    root = fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/'),
+        files={
+            'memory.max': '1000\n',
+            'memory.current': '900\n',
+            'memory.stat': 'inactive_file 100\nfile_dirty 300\nfile_writeback 50\n',
+        },
+    )
+
+    # The whole 900 of `memory.current` is charged, and no more.
+    assert cgroup.read_memory() == cgroup.RawMemory(
+        limit=1000,
+        used=900,
+        available=100,
+        unflushed_cache=350,
+        limit_level=str(root),
+        unreadable_level=None,
+        usage_unreadable_level=None,
+    )
+
+
+def test_read_memory_without_the_dirty_keys(fake_cgroup: Callable[..., Path]) -> None:
+    """Credits the whole inactive cache where neither key is there, and reports the cache as unknown."""
+    # A cgroup v1 stat file with no dirty or writeback key at all.
+    root = fake_cgroup(
+        mountinfo=V1_MOUNTINFO,
+        self_cgroup=V1_SELF_CGROUP.format(path='/'),
+        files={
+            'memory/memory.limit_in_bytes': '1000\n',
+            'memory/memory.usage_in_bytes': '900\n',
+            'memory/memory.stat': (
+                'cache 500\nrss 300\nmapped_file 40\npgpgin 100\npgpgout 50\n'
+                'inactive_anon 0\nactive_anon 300\ninactive_file 400\nactive_file 100\n'
+                'hierarchical_memory_limit 1000\n'
+                'total_cache 500\ntotal_rss 300\ntotal_active_file 100\ntotal_inactive_file 400\n'
+            ),
+        },
+    )
+
+    # 900 charged less the whole 400 of inactive cache, as the working set alone reports.
+    assert cgroup.read_memory() == cgroup.RawMemory(
+        limit=1000,
+        used=500,
+        available=500,
+        unflushed_cache=None,
+        limit_level=str(root / 'memory'),
+        unreadable_level=None,
+        usage_unreadable_level=None,
+    )
+
+
+def test_read_memory_dirty_keys_without_the_inactive_cache(fake_cgroup: Callable[..., Path]) -> None:
+    """Names the level where the inactive cache is missing, whatever else the stat file carries."""
+    root = fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/'),
+        files={
+            'memory.max': '1000\n',
+            'memory.current': '900\n',
+            'memory.stat': 'anon 300\nfile_dirty 200\nfile_writeback 100\n',
+        },
+    )
+
+    assert cgroup.read_memory() == cgroup.RawMemory(
+        limit=1000,
+        used=None,
+        available=None,
+        unflushed_cache=None,
+        limit_level=str(root),
+        unreadable_level=None,
+        usage_unreadable_level=str(root),
+    )
+
+
+def test_read_memory_reports_the_cache_of_the_deciding_level(fake_cgroup: Callable[..., Path]) -> None:
+    """Keeps the smallest distance of the chain, and reports the waiting cache of the level that set it."""
+    root = fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/kubepods/pod'),
+        files={
+            # The tighter limit, and 80 bytes from it. Its stat file carries neither key.
+            'kubepods/pod/memory.max': '100\n',
+            'kubepods/pod/memory.current': '30\n',
+            'kubepods/pod/memory.stat': 'inactive_file 10\n',
+            # The node allows less room, and part of what it holds is cache that has not reached the disk.
+            'kubepods/memory.max': '120\n',
+            'kubepods/memory.current': '110\n',
+            'kubepods/memory.stat': 'inactive_file 10\nfile_dirty 4\nfile_writeback 1\n',
+        },
+    )
+
+    # The node credits 5 of its 10 of inactive cache, so 105 is charged there. The room is 15 there and 80 at
+    # the pod. The cache reported is the node's, because the node decided. The pod holds the tightest limit.
+    assert cgroup.read_memory() == cgroup.RawMemory(
+        limit=100,
+        used=85,
+        available=15,
+        unflushed_cache=5,
+        limit_level=str(root / 'kubepods' / 'pod'),
+        unreadable_level=None,
+        usage_unreadable_level=None,
+    )
+
+
+def test_read_memory_reports_the_cache_of_the_closest_level_on_a_tie(fake_cgroup: Callable[..., Path]) -> None:
+    """Reports the waiting cache of the level closest to this process where two levels leave the same room."""
+    root = fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/kubepods/pod'),
+        files={
+            # The tighter limit, closest to this process.
+            'kubepods/pod/memory.max': '100\n',
+            'kubepods/pod/memory.current': '50\n',
+            'kubepods/pod/memory.stat': 'inactive_file 10\nfile_dirty 2\nfile_writeback 0\n',
+            # The looser limit, with the same room left.
+            'kubepods/memory.max': '120\n',
+            'kubepods/memory.current': '72\n',
+            'kubepods/memory.stat': 'inactive_file 16\nfile_dirty 6\nfile_writeback 0\n',
+        },
+    )
+
+    # The pod holds the tightest limit. It credits 8 of its 10 of inactive cache, so 42 is charged there. The node
+    # credits 10 of its 16, so 62 is charged there. The room is 58 at both levels. The cache reported is the pod's 2,
+    # because the pod is closest to this process. The node's 6 would mean the tie went to the ancestor.
+    assert cgroup.read_memory() == cgroup.RawMemory(
+        limit=100,
+        used=42,
+        available=58,
+        unflushed_cache=2,
+        limit_level=str(root / 'kubepods' / 'pod'),
+        unreadable_level=None,
+        usage_unreadable_level=None,
+    )
+
+
+def test_read_memory_reads_the_stat_file_once_per_level(
+    fake_cgroup: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Parses `memory.stat` once per level, after `memory.current`."""
+    root = fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/pod/container'),
+        files={
+            'pod/container/memory.max': '1000\n',
+            'pod/container/memory.current': '900\n',
+            'pod/container/memory.stat': 'inactive_file 600\nfile_dirty 200\nfile_writeback 100\n',
+            'pod/memory.max': '2000\n',
+            'pod/memory.current': '1500\n',
+            'pod/memory.stat': 'inactive_file 400\nfile_dirty 100\nfile_writeback 50\n',
+        },
+    )
+
+    read: list[str] = []
+    read_stat_values, read_counter = cgroup._read_stat_values, cgroup._read_counter
+
+    def record_stat_values(path: Path, keys: tuple[str, ...]) -> dict[str, int] | None:
+        read.append(str(path))
+        return read_stat_values(path, keys)
+
+    def record_counter(path: Path) -> int | None:
+        read.append(str(path))
+        return read_counter(path)
+
+    monkeypatch.setattr(cgroup, '_read_stat_values', record_stat_values)
+    monkeypatch.setattr(cgroup, '_read_counter', record_counter)
+
+    # Only that a reading happened matters here.
+    assert cgroup.read_memory().used is not None
+
+    # Two levels, so this pins one parse per level rather than one parse in total. Whole paths, because both
+    # levels name the file `memory.stat`.
+    for level in (root / 'pod' / 'container', root / 'pod'):
+        assert read.count(str(level / 'memory.stat')) == 1
+        assert read.index(str(level / 'memory.current')) < read.index(str(level / 'memory.stat'))
+
+
+def test_read_memory_with_the_dirty_keys_at_zero(fake_cgroup: Callable[..., Path]) -> None:
+    """Reports zero, not unknown, where both keys are there and read zero."""
+    root = fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/'),
+        files={
+            'memory.max': '1000\n',
+            'memory.current': '900\n',
+            'memory.stat': 'inactive_file 600\nfile_dirty 0\nfile_writeback 0\n',
+        },
+    )
+
+    # The whole 600 of inactive cache is credited, as where neither key is there.
+    assert cgroup.read_memory() == cgroup.RawMemory(
+        limit=1000,
+        used=300,
+        available=700,
+        unflushed_cache=0,
+        limit_level=str(root),
+        unreadable_level=None,
+        usage_unreadable_level=None,
+    )
+
+
+def test_read_memory_unparsable_dirty_key(fake_cgroup: Callable[..., Path]) -> None:
+    """Counts the usable key where the other one is not a number."""
+    root = fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/'),
+        files={
+            'memory.max': '1000\n',
+            'memory.current': '900\n',
+            'memory.stat': 'inactive_file 600\nfile_dirty not-a-number\nfile_writeback 100\n',
+        },
+    )
+
+    # The 100 of writeback comes off the 600 of inactive cache.
+    assert cgroup.read_memory() == cgroup.RawMemory(
+        limit=1000,
+        used=400,
+        available=600,
+        unflushed_cache=100,
+        limit_level=str(root),
+        unreadable_level=None,
+        usage_unreadable_level=None,
+    )
+
+
+def test_read_cpu_usage_repeated_key(fake_cgroup: Callable[..., Path]) -> None:
+    """Takes the first occurrence of a repeated key."""
+    # No kernel repeats a key. `cpu.stat` goes through the parser `memory.stat` uses, so this pins it for both.
+    fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/'),
+        files={'cpu.stat': 'usage_usec 2500000\nusage_usec 9900000\n'},
+    )
+
+    assert cgroup.read_cpu_usage() == 2.5
+
+
+def test_read_memory_negative_dirty_key(fake_cgroup: Callable[..., Path]) -> None:
+    """Credits no more than the inactive cache holds where a key reads negative."""
+    root = fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/'),
+        files={
+            'memory.max': '1000\n',
+            'memory.current': '900\n',
+            'memory.stat': 'inactive_file 600\nfile_dirty -100\nfile_writeback 0\n',
+        },
+    )
+
+    # The whole 600 of inactive cache is credited and no more.
+    assert cgroup.read_memory() == cgroup.RawMemory(
+        limit=1000,
+        used=300,
+        available=700,
+        unflushed_cache=0,
+        limit_level=str(root),
+        unreadable_level=None,
+        usage_unreadable_level=None,
+    )
+
+
+def test_read_memory_negative_key_beside_a_positive_one(fake_cgroup: Callable[..., Path]) -> None:
+    """Lets a key that reads negative take nothing off what the other one reported."""
+    root = fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/'),
+        files={
+            'memory.max': '1000\n',
+            'memory.current': '900\n',
+            'memory.stat': 'inactive_file 600\nfile_dirty -100\nfile_writeback 500\n',
+        },
+    )
+
+    # The 500 of writeback stands on its own, so 100 of the 600 is credited and 800 stays charged.
+    assert cgroup.read_memory() == cgroup.RawMemory(
+        limit=1000,
+        used=800,
+        available=200,
+        unflushed_cache=500,
+        limit_level=str(root),
+        unreadable_level=None,
+        usage_unreadable_level=None,
+    )

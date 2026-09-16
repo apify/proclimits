@@ -164,9 +164,15 @@ class RawMemory:
     """
 
     available: int | None
-    """The memory that can still be allocated before the limit, in bytes, as the mechanism reports it.
+    """The distance to the limit, in bytes, as the mechanism reports it.
 
     Filled with `used` and `None` with it: the two are the pair a limit is reported against.
+    """
+
+    unflushed_cache: int | None
+    """The pages waiting to be written to disk, in bytes, at the level whose distance set `available`.
+
+    `None` where the mechanism does not report such pages, or where the usage was not read.
     """
 
     limit_level: str | None

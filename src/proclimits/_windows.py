@@ -289,6 +289,7 @@ _NO_MEMORY = RawMemory(
     limit=None,
     used=None,
     available=None,
+    unflushed_cache=None,
     limit_level=None,
     unreadable_level=None,
     usage_unreadable_level=None,
@@ -299,6 +300,7 @@ _UNREADABLE_MEMORY = RawMemory(
     limit=None,
     used=None,
     available=None,
+    unflushed_cache=None,
     limit_level=None,
     unreadable_level=_LEVEL,
     usage_unreadable_level=None,
@@ -331,6 +333,7 @@ def read_memory() -> RawMemory:
             limit=process_limit,
             used=None,
             available=None,
+            unflushed_cache=None,
             limit_level=_LEVEL,
             unreadable_level=None,
             usage_unreadable_level=None,
@@ -564,6 +567,8 @@ def _job_memory(limit: int) -> RawMemory:
         limit=limit,
         used=charged,
         available=available,
+        # A job limits commit, and no cache is charged against commit.
+        unflushed_cache=None,
         limit_level=_LEVEL,
         unreadable_level=None,
         # Nothing charged takes two unrelated APIs refusing at once, and has never been seen on a machine.
