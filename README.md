@@ -10,7 +10,7 @@ Reading the cgroup files directly is not enough either. The limit that applies i
 
 This package handles both, and reports only what actually restricts the process. `None` means nothing visible to the process restricts it - the machine is then the honest answer, and `get_machine_cpu_count()` and `get_machine_memory_bytes()` below give it.
 
-Off Linux and Windows every limit reads as `None`. Some examples below pair this package with `psutil`, which it does not require - `psutil` answers what the machine is using, which is not a question about limits.
+Off Linux and Windows every limit reads as `None`. macOS still reports the memory and the CPU cores of the machine. On other platforms the machine facts can read as `None`. Some examples below pair this package with `psutil`, which it does not require - `psutil` answers what the machine is using, which is not a question about limits.
 
 ## How it reads a limit
 
