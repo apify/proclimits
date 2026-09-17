@@ -516,8 +516,14 @@ def machine_cpu_count() -> int:
 
     Not the `get_machine_cpu_count()` of the package: a test that asks the subject for the expected value
     proves nothing. On Linux the two really differ - the package reads `/sys/devices/system/cpu/online` and
-    this reads `sysconf`. On Windows both end at `GetActiveProcessorCount`, asked here directly.
+    this reads `sysconf`. On Windows both end at `GetActiveProcessorCount`, asked here directly. On macOS this
+    reads `sysctl`, see `darwin_sysctl()` for what that can and cannot catch.
     """
+    if sys.platform == 'darwin':
+        # Apple Libc `gen/FreeBSD/sysconf.c` answers `SC_NPROCESSORS_ONLN` and `SC_NPROCESSORS_CONF` from the
+        # same `HW_NCPU` sysctl, which is `hw.ncpu`.
+        return darwin_sysctl('hw.ncpu')
+
     if sys.platform == 'win32':
         cores = windows_machine_facts().cores
         if not cores:
@@ -571,11 +577,28 @@ def delegated_controllers() -> frozenset[str]:
 
 def machine_memory_bytes() -> int:
     """The memory of this machine, in bytes. Read here rather than asked of the package, as above."""
+    if sys.platform == 'darwin':
+        return darwin_sysctl('hw.memsize')
+
     for line in Path('/proc/meminfo').read_text().splitlines():
         if line.startswith('MemTotal:'):
             return int(line.split()[1]) * 1024
 
     pytest.fail('/proc/meminfo carries no MemTotal')
+
+
+def darwin_sysctl(name: str) -> int:
+    """Read one numeric kernel value of macOS through the `sysctl` tool.
+
+    `sysconf` in the package reads the same kernel values, so this is not an independent measurement of the
+    kernel, and a wrong kernel value goes unnoticed. For the memory it catches a wrong `sysconf` name, a wrong
+    product of the two, or a name missing from the `sysconf` table of the interpreter, which reads as `None`.
+    For the cores it catches only a wrong number, not the path that produced it: where `sysconf` fails, the
+    package falls back to `os.cpu_count()`, which answers the same number on macOS.
+    """
+    answer = subprocess.run(['sysctl', '-n', name], capture_output=True, text=True, check=True, timeout=60)
+
+    return int(answer.stdout.strip())
 
 
 @dataclass(frozen=True)

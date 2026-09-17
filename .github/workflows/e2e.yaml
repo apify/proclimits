@@ -169,6 +169,28 @@ jobs:
           E2E_WINDOWS_IMAGE: ${{ matrix.image }}
         run: uv run pytest tests/e2e/test_windows_containers.py
 
+  # No mechanism here carries a limit, so the lane checks the machine facts and the notices that say so. The
+  # interpreters are not a matrix axis. `test_python_versions` asks uv for each one.
+  macos:
+    name: macos
+    runs-on: macos-latest
+    timeout-minutes: 20
+    env:
+      UV_PYTHON: '3.13'
+      E2E_PLATFORM: darwin
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up uv package manager
+        uses: astral-sh/setup-uv@v10.0.1
+
+      - name: Install dependencies
+        run: uv run poe install-dev
+
+      - name: Run the macOS tests
+        run: uv run pytest tests/e2e/test_macos.py
+
   kubernetes:
     name: kubernetes
     runs-on: ubuntu-latest
@@ -234,7 +256,7 @@ jobs:
 
   checks:
     name: E2E checks
-    needs: [machine, containers, arm, podman, windows, kubernetes, guest]
+    needs: [machine, containers, arm, podman, windows, macos, kubernetes, guest]
     if: always()
     runs-on: ubuntu-latest
     steps:
