@@ -158,6 +158,41 @@ def test_python_versions(python_version: str) -> None:
     assert reading.cpu_limit == QUOTA_CORES
 
 
+def test_unwritten_file_cache_is_charged() -> None:
+    """Charges file cache that has not reached the disk."""
+    # `/burst` is on the container's own filesystem, not a tmpfs. Tmpfs pages are shmem. They are never counted
+    # as dirty or as `inactive_file`, so a tmpfs would move nothing whichever formula is in use.
+    setup = f"""
+    set -e
+    mkdir -p /burst
+    exec {probe_command()} /burst
+    """
+
+    reading = probe_in_container('--memory', str(MEMORY_LIMIT), command=['sh', '-c', setup])
+
+    check_invariants(reading)
+
+    # Every lane that runs this carries the keys. Cgroup v2 on the hosted runners spells `file_dirty`, and the
+    # v1 guests run kernels that spell `total_dirty`.
+    assert reading.raw_memory_unflushed_cache is not None, (
+        'no dirty or writeback pages were reported: either this kernel does not report them at all, or the '
+        'key names in the _FileNames table are wrong for this interface'
+    )
+
+    assert reading.burst_written is not None
+    assert reading.used_before is not None
+    assert reading.used_after is not None
+    assert reading.unflushed_after is not None
+
+    # A delta inside one process, because the probe's own footprint is tens of megabytes. The quarter allows
+    # for pages whose writeback finished before the second reading. Crediting the burst as free cache, as the
+    # working set alone does, moves this by a few megabytes at most.
+    assert reading.used_after - reading.used_before >= reading.burst_written * 3 // 4
+
+    # The field that reports those pages has to show them too.
+    assert reading.unflushed_after >= reading.burst_written * 3 // 4
+
+
 def test_cpu_shares_are_not_a_limit() -> None:
     """Reports no CPU limit for a container given shares, which weigh it against others but cap nothing."""
     # With a tenth of the shares it still gets the whole machine when nothing else wants it. Reporting them as

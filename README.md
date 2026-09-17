@@ -137,18 +137,20 @@ Do not divide `get_cpu_usage()` by `get_cpu_limit()`. The counter is read at the
 
 | Attribute | Answers |
 | --- | --- |
-| `available` | how much more memory can be allocated before something kills this process, as the mechanism reports it |
+| `available` | how much more memory the limit leaves room for, as the mechanism reports it |
 | `limit` | the tightest limit on the chain, in bytes |
 | `used` | the memory charged against that limit, as the mechanism counts it |
 | `used_ratio` | `used / limit` |
 
 `available` is the number to size a budget from, and it is read from the mechanism rather than worked out from the other two: a kill follows from a distance, not from a ratio. On Linux it is the smallest distance to any limit on the chain, and `used` is whatever keeps that distance exact against the tightest of them - so it need not match the content of any file. On Windows it is what the job may still commit, which is the distance to the job's own limit. `used_ratio` follows from the pair, and is the approximate one.
 
+On Linux the distance counts as free the inactive file cache that is not waiting to reach the disk. The kernel has to reclaim that cache before it hands the memory out. So the number sizes a budget and does not promise the next allocation. Right after writing it reads lower. It stays lower until the data reaches the disk. On default kernel settings that can be more than half a minute after the writing stopped.
+
 It answers for the limit, not for the machine. A host that is itself running out of memory can refuse an allocation that every number here says there is room for. A cgroup limit does not see the host swapping, and a job's commit headroom does not fall when the machine's does.
 
 The level those numbers describe may be above this process - the pod, or the slice. `describe().memory_limit_level` names it. Everything under that level is charged there, so `used_ratio` is the share of the level rather than of this process. `available` still answers for this process: the room left at that level is the room left here.
 
-`used` is counted differently on the two mechanisms. On Linux it excludes the inactive file cache, as `docker stats` and `kubectl top` do; those read one cgroup and never walk up, so they agree with this only while a single level holds a limit. On Windows it is the commit charge of the job, the "Commit size" column rather than the "Working set" one: a process that has committed a gigabyte and touched a tenth of it is charged the gigabyte, because that is what the limit counts.
+`used` is counted differently on the two mechanisms. On Linux it leaves out the inactive file cache, less the pages waiting to be written to disk. It equals the working set that `docker stats` and `kubectl top` report while no pages wait. While pages wait, it reads above that working set on kernels that report them. Waiting pages on the active list come off the credit too, so it can read high. Those tools read one cgroup and never walk up, so they agree with this only while a single level holds a limit. On Windows it is the commit charge of the job, the "Commit size" column rather than the "Working set" one: a process that has committed a gigabyte and touched a tenth of it is charged the gigabyte, because that is what the limit counts.
 
 ## What it does not do
 
@@ -165,6 +167,7 @@ Process affinity stays out too. `taskset` on Linux, and `SetProcessAffinityMask`
 | `raw_memory_limit`, `raw_cpu_quota`, `raw_cpu_set_size` | the values as the mechanism spells them, before anything was dropped |
 | `raw_memory_used` | the usage paired with the raw limit |
 | `raw_memory_available` | the room the mechanism reported, before it was brought within the distance to the limit |
+| `raw_memory_unflushed_cache` | the pages waiting to reach the disk, at the level the room was measured at, which can be above `memory_limit_level` |
 | `memory_limit_level`, `cpu_limit_level` | the level each limit came from - the memory one names it even where the reading was dropped |
 | `cpu_rate_level` | the level a CPU rate is measured in |
 | `memory_source`, `cpu_quota_source`, `cpu_set_source`, `cpu_usage_source` | the interface each metric would be read through, and the chain searched for it |

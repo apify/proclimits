@@ -197,6 +197,7 @@ def test_get_memory_budget_usage_the_mechanism_does_not_offer(monkeypatch: pytes
         limit=256 * 1024 * 1024,
         used=None,
         available=None,
+        unflushed_cache=None,
         limit_level='job',
         unreadable_level=None,
         usage_unreadable_level=None,
@@ -213,6 +214,7 @@ def test_get_memory_budget_brings_a_disagreeing_triple_into_range(monkeypatch: p
         limit=1000,
         used=1200,
         available=900,
+        unflushed_cache=None,
         limit_level='job',
         unreadable_level=None,
         usage_unreadable_level=None,
@@ -232,6 +234,7 @@ def test_get_memory_budget_keeps_a_room_the_mechanism_made_smaller(monkeypatch: 
         limit=1000,
         used=250,
         available=100,
+        unflushed_cache=None,
         limit_level='job',
         unreadable_level=None,
         usage_unreadable_level=None,
@@ -773,6 +776,8 @@ def test_describe(fake_cgroup: Callable[..., Path]) -> None:
     assert description.cpu_usage_source == proclimits.Source(interface=v2, levels=(str(root),))
     assert description.raw_memory_limit == 536870912
     assert description.raw_memory_used == 100000000
+    # The stat file carries neither the dirty key nor the writeback key.
+    assert description.raw_memory_unflushed_cache is None
     assert description.memory_limit_level == str(root)
     # The set of four cores is the effective limit here, and its time is counted in the own cgroup.
     assert description.cpu_limit_level == str(root)
@@ -782,6 +787,25 @@ def test_describe(fake_cgroup: Callable[..., Path]) -> None:
     assert description.machine_memory_bytes == MACHINE_TOTAL_BYTES
     assert description.machine_cpu_count == MACHINE_CORES
     assert [notice.code for notice in description.notices] == ['cpu-quota-covers-machine']
+
+
+def test_describe_reports_the_unflushed_cache(fake_cgroup: Callable[..., Path]) -> None:
+    """Carries the cache waiting to reach the disk through to the description."""
+    fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/'),
+        files={
+            'memory.max': '536870912\n',
+            'memory.current': '150000000\n',
+            'memory.stat': 'inactive_file 50000000\nfile_dirty 30000000\nfile_writeback 10000000\n',
+        },
+    )
+
+    description = proclimits.describe()
+
+    # 40000000 of the 50000000 of inactive cache is waiting, so 10000000 is credited and 140000000 stays charged.
+    assert description.raw_memory_unflushed_cache == 40000000
+    assert description.raw_memory_used == 140000000
 
 
 def test_describe_hybrid_interfaces(fake_cgroup: Callable[..., Path]) -> None:

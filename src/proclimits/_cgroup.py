@@ -56,6 +56,12 @@ class _FileNames:
     inactive_file: str
     """The `memory_stat` key holding the inactive file cache."""
 
+    file_dirty: str
+    """The `memory_stat` key holding the file cache modified and not yet written."""
+
+    file_writeback: str
+    """The `memory_stat` key holding the pages being written to disk."""
+
     cpu_quota: str
     """Holds the CPU bandwidth quota."""
 
@@ -71,6 +77,8 @@ _V2 = _FileNames(
     memory_usage='memory.current',
     memory_stat='memory.stat',
     inactive_file='inactive_file',
+    file_dirty='file_dirty',
+    file_writeback='file_writeback',
     cpu_quota='cpu.max',
     cpu_usage='cpu.stat',
     cpu_set='cpuset.cpus.effective',
@@ -81,6 +89,8 @@ _V1 = _FileNames(
     memory_usage='memory.usage_in_bytes',
     memory_stat='memory.stat',
     inactive_file='total_inactive_file',
+    file_dirty='total_dirty',
+    file_writeback='total_writeback',
     cpu_quota='cpu.cfs_quota_us',
     cpu_usage='cpuacct.usage',
     cpu_set='cpuset.cpus',
@@ -236,23 +246,54 @@ class Controllers:
 
 
 @dataclass(frozen=True)
+class _MemoryUsage:
+    """What one level is charged, and how much of that charge is file cache the kernel cannot drop yet."""
+
+    charged: int
+    """The memory charged to the level, in bytes, with the droppable inactive file cache credited back."""
+
+    unflushed_cache: int | None
+    """The pages waiting to be written to disk, in bytes, or `None` where the stat file carries neither key usably."""
+
+
+@dataclass(frozen=True)
 class _MemoryLevel:
     """One level of the chain that holds a memory limit."""
 
     limit: int
     """The limit that level holds, in bytes."""
 
-    usage: int | None
-    """The working set of that level, in bytes, or `None` when it cannot be read."""
+    usage: _MemoryUsage | None
+    """What that level is charged, or `None` when it cannot be read."""
 
     directory: Path
     """The cgroup the two were read from."""
+
+    @property
+    def distance(self) -> int | None:
+        """How far the charge of that level is from its limit, in bytes, or `None` when the usage cannot be read.
+
+        Negative while the level sits above its limit.
+        """
+        if self.usage is None:
+            return None
+
+        return self.limit - self.usage.charged
+
+    @property
+    def available(self) -> int | None:
+        """The room left under the limit, in bytes, clamped at zero. `None` when the usage cannot be read.
+
+        A level sits above its limit while the kernel reclaims. Nothing can be allocated there.
+        """
+        return None if self.distance is None else max(self.distance, 0)
 
 
 _NO_MEMORY = RawMemory(
     limit=None,
     used=None,
     available=None,
+    unflushed_cache=None,
     limit_level=None,
     unreadable_level=None,
     usage_unreadable_level=None,
@@ -278,6 +319,7 @@ def read_memory() -> RawMemory:
             limit=None,
             used=None,
             available=None,
+            unflushed_cache=None,
             limit_level=None,
             unreadable_level=str(unreadable.directory),
             usage_unreadable_level=None,
@@ -288,32 +330,27 @@ def read_memory() -> RawMemory:
 
     tightest = min(levels, key=lambda level: level.limit)
 
-    # An unknown distance may be the smallest one, so the minimum of the rest would promise memory the kernel
-    # will not give. Never the other kind of empty pair: a controller is located by its usage file, so a
-    # hierarchy without one is never found at all.
-    silent = next((level for level in levels if level.usage is None), None)
-    if silent is not None:
+    # Memory is charged up the whole chain. An ancestor counts what its other children use, so its distance can be
+    # smaller than the tightest level's. An unknown distance may be the smallest, so it ranks first and no usage is
+    # reported. Skipping it would promise memory the kernel will not give.
+    min_distance_level = min(levels, key=lambda level: float('-inf') if level.distance is None else level.distance)
+
+    if min_distance_level.usage is None or min_distance_level.available is None:
         return RawMemory(
             limit=tightest.limit,
             used=None,
             available=None,
+            unflushed_cache=None,
             limit_level=str(tightest.directory),
             unreadable_level=None,
-            usage_unreadable_level=str(silent.directory),
+            usage_unreadable_level=str(min_distance_level.directory),
         )
-
-    # Every level, not only the tightest: memory is charged up the whole chain, so an ancestor counts what its
-    # other children use, and its distance can be the smaller one.
-    distances = [level.limit - level.usage for level in levels if level.usage is not None]
-
-    # A cgroup sits above its limit while the kernel reclaims, and that level's distance is then negative.
-    # Nothing can be allocated there, which is what a distance of zero says.
-    available = max(min(distances), 0)
 
     return RawMemory(
         limit=tightest.limit,
-        used=tightest.limit - available,
-        available=available,
+        used=tightest.limit - min_distance_level.available,
+        available=min_distance_level.available,
+        unflushed_cache=min_distance_level.usage.unflushed_cache,
         limit_level=str(tightest.directory),
         unreadable_level=None,
         usage_unreadable_level=None,
@@ -342,7 +379,7 @@ def _read_memory_levels(controller: Controller) -> list[_MemoryLevel]:
         if limit < 0:
             raise _UnreadableFileError(directory)
 
-        levels.append(_MemoryLevel(limit=limit, usage=_read_working_set(controller, directory), directory=directory))
+        levels.append(_MemoryLevel(limit=limit, usage=_read_memory_usage(controller, directory), directory=directory))
 
     return levels
 
@@ -718,22 +755,53 @@ def _cpu_usage_level(directory: Path, source: Controller) -> str | None:
     return str(translated) if _exists(translated / usage.names.cpu_usage) else None
 
 
-def _read_working_set(controller: Controller, directory: Path) -> int | None:
-    """Read the memory charged to one cgroup, in bytes. Excludes the inactive file cache.
+def _read_memory_usage(controller: Controller, directory: Path) -> _MemoryUsage | None:
+    """Read what one cgroup is charged, crediting back the inactive file cache the kernel can drop.
 
-    Subtracting it gives the working set - the figure `docker stats` and `kubectl top` report. The active file
-    cache is reclaimable too and stays counted, as it does there.
+    The pages waiting to be written to disk come off that credit. They cannot be dropped until they reach the
+    disk. `docker stats` credits the whole inactive cache instead. Measured on cgroup v2, that is too much: a
+    process that allocated the room reported right after an unsynced write burst was OOM-killed. The active
+    file cache is reclaimable too and stays counted, as it does in `docker stats`.
     """
-    current = _read_counter(directory / controller.names.memory_usage)
+    names = controller.names
+
+    current = _read_counter(directory / names.memory_usage)
     if current is None:
         return None
 
+    # Read after the charge. Near the limit reclaim shrinks the cache, so a later reading leans to less credit.
+    # One parse for the three keys, so they describe one instant.
+    stat = _read_stat_values(
+        directory / names.memory_stat,
+        (names.inactive_file, names.file_dirty, names.file_writeback),
+    )
+    if stat is None:
+        return None
+
     # No fallback to the raw usage. That would count the inactive file cache as usage.
-    inactive_file = _read_stat_value(directory / controller.names.memory_stat, controller.names.inactive_file)
+    inactive_file = stat.get(names.inactive_file)
     if inactive_file is None:
         return None
 
-    return max(current - inactive_file, 0)
+    dirty = stat.get(names.file_dirty)
+    writeback = stat.get(names.file_writeback)
+
+    # Where neither key is usable, the whole inactive cache is credited. Cgroup v1 before 3.12 carries neither.
+    # Dropping the usage there would send a consumer to the memory of the machine.
+    #
+    # One key is enough. Cgroup v1 has `total_writeback` from 3.12 but `total_dirty` only from 4.2.
+    # Each key is clamped on its own, so a negative counter cannot cancel the other.
+    unflushed_cache = (
+        None
+        if dirty is None and writeback is None
+        else sum(max(value, 0) for value in (dirty, writeback) if value is not None)
+    )
+
+    # The difference can go below zero with both counts right. A dirty page on the active list is waiting to be
+    # written and is not in the inactive cache.
+    credit = max(inactive_file - (unflushed_cache or 0), 0)
+
+    return _MemoryUsage(charged=max(current - credit, 0), unflushed_cache=unflushed_cache)
 
 
 def _locate_controller(hierarchies: _Hierarchies, metric: _Metric) -> Controller | None:
@@ -1042,13 +1110,34 @@ def _read_limit(path: Path) -> int | None:
 
 def _read_stat_value(path: Path, key: str) -> int | None:
     """Read one entry of a control file holding `<key> <value>` lines."""
+    values = _read_stat_values(path, (key,))
+
+    return values.get(key) if values is not None else None
+
+
+def _read_stat_values(path: Path, keys: tuple[str, ...]) -> dict[str, int] | None:
+    """Read several entries of a control file holding `<key> <value>` lines, in one pass.
+
+    Returns:
+        An entry for each of `keys` that the file carries a number for, or `None` where the file cannot be read.
+    """
+    found: dict[str, int] = {}
+
     try:
         with path.open() as file:
             for line in file:
                 entry_key, _separator, value = line.partition(' ')
-                if entry_key == key:
-                    return int(value)
+                if entry_key not in keys or entry_key in found:
+                    continue
+
+                try:
+                    found[entry_key] = int(value)
+                except ValueError:
+                    continue
+
+                if len(found) == len(keys):
+                    break
     except (OSError, ValueError):
         return None
 
-    return None
+    return found
