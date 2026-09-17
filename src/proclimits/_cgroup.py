@@ -269,6 +269,25 @@ class _MemoryLevel:
     directory: Path
     """The cgroup the two were read from."""
 
+    @property
+    def distance(self) -> int | None:
+        """How far the charge of that level is from its limit, in bytes, or `None` when the usage cannot be read.
+
+        Negative while the level sits above its limit.
+        """
+        if self.usage is None:
+            return None
+
+        return self.limit - self.usage.charged
+
+    @property
+    def available(self) -> int | None:
+        """The room left under the limit, in bytes, clamped at zero. `None` when the usage cannot be read.
+
+        A level sits above its limit while the kernel reclaims. Nothing can be allocated there.
+        """
+        return None if self.distance is None else max(self.distance, 0)
+
 
 _NO_MEMORY = RawMemory(
     limit=None,
@@ -311,11 +330,12 @@ def read_memory() -> RawMemory:
 
     tightest = min(levels, key=lambda level: level.limit)
 
-    # An unknown distance may be the smallest one, so the minimum of the rest would promise memory the kernel
-    # will not give. Never the other kind of empty pair: a controller is located by its usage file, so a
-    # hierarchy without one is never found at all.
-    silent = next((level for level in levels if level.usage is None), None)
-    if silent is not None:
+    # Memory is charged up the whole chain. An ancestor counts what its other children use, so its distance can be
+    # smaller than the tightest level's. An unknown distance may be the smallest, so it ranks first and no usage is
+    # reported. Skipping it would promise memory the kernel will not give.
+    min_distance_level = min(levels, key=lambda level: float('-inf') if level.distance is None else level.distance)
+
+    if min_distance_level.usage is None or min_distance_level.available is None:
         return RawMemory(
             limit=tightest.limit,
             used=None,
@@ -323,25 +343,14 @@ def read_memory() -> RawMemory:
             unflushed_cache=None,
             limit_level=str(tightest.directory),
             unreadable_level=None,
-            usage_unreadable_level=str(silent.directory),
+            usage_unreadable_level=str(min_distance_level.directory),
         )
-
-    # Every level, not only the tightest: memory is charged up the whole chain, so an ancestor counts what its
-    # other children use, and its distance can be the smaller one.
-    distances = [(level.limit - level.usage.charged, level.usage) for level in levels if level.usage is not None]
-
-    # The level the room was measured at is the one whose cache explains it, so the two are taken together.
-    smallest, decisive = min(distances, key=lambda found: found[0])
-
-    # A cgroup sits above its limit while the kernel reclaims, and that level's distance is then negative.
-    # Nothing can be allocated there, which is what a distance of zero says.
-    available = max(smallest, 0)
 
     return RawMemory(
         limit=tightest.limit,
-        used=tightest.limit - available,
-        available=available,
-        unflushed_cache=decisive.unflushed_cache,
+        used=tightest.limit - min_distance_level.available,
+        available=min_distance_level.available,
+        unflushed_cache=min_distance_level.usage.unflushed_cache,
         limit_level=str(tightest.directory),
         unreadable_level=None,
         usage_unreadable_level=None,
