@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "proclimits"
-version = "0.1.0"
+version = "0.2.0"
 description = "Resource limits that actually apply to the running process, from cgroups or Windows job objects"
 authors = [
     { name = "Apify Technologies s.r.o.", email = "support@apify.com" },
