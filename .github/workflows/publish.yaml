@@ -130,7 +130,7 @@ jobs:
         with:
           package_name: ${{ env.IMPORT_NAME }}
           dist_dir: dist
-          python_version: '3.14'
+          python_version: '3.15'
           smoke_code: |
             import ${{ env.IMPORT_NAME }} as package
 

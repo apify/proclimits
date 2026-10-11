@@ -62,7 +62,7 @@ DISTRO_IMAGES = (
 PYTHON_VERSION = '3.13'
 """The Python version the container lanes and the Windows stage ask uv for. The image supplies it where it matches."""
 
-PYTHON_VERSIONS = ('3.10', '3.11', '3.12', '3.13', '3.14')
+PYTHON_VERSIONS = ('3.10', '3.11', '3.12', '3.13', '3.14', '3.15')
 """Every interpreter the package supports, as the classifiers list them."""
 
 UV_DOWNLOADS = Path(tempfile.gettempdir()) / 'proclimits-e2e-uv'

@@ -24,8 +24,8 @@ Every task below runs through [poe](https://poethepoet.natn.io/):
 ## Tests
 
 The unit tests run anywhere. `uv run poe check-code` covers what usually breaks, but it is not everything a
-pull request runs: CI repeats the unit tests on five interpreters across Linux and Windows, runs the whole
-end-to-end suite, and checks the pull request title.
+pull request runs: CI repeats the unit tests on every supported interpreter across Linux and Windows, runs
+the whole end-to-end suite, and checks the pull request title.
 
 The end-to-end tests read the machine they run on, so what they can check depends on that machine. Tests
 whose environment is missing skip themselves. Four markers name the environments that are not universal:
