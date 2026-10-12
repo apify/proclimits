@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   # The interpreter is a real axis only for what the probe runs on: the container tests name the version
-  # themselves, and running the lane once per version would repeat identical work five times.
+  # themselves, and running the lane once per version would repeat identical work six times.
   machine:
     name: machine (python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
@@ -26,7 +26,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ['3.10', '3.11', '3.12', '3.13', '3.14']
+        python-version: ['3.10', '3.11', '3.12', '3.13', '3.14', '3.15']
     env:
       # The suite itself, and with it the probe on this machine, runs on the version of the matrix.
       UV_PYTHON: ${{ matrix.python-version }}

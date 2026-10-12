@@ -838,8 +838,8 @@ def _first_with(dirs: tuple[Path, ...], file_name: str) -> Path | None:
 def _exists(path: Path) -> bool:
     """Whether a path exists.
 
-    `Path.exists()` raises on a directory this process may not traverse. Only Python 3.14 turns that into
-    `False`, and a cgroup chain can hold such a directory.
+    Before Python 3.14, `Path.exists()` raises on a directory this process may not traverse. A cgroup chain can
+    hold such a directory.
     """
     try:
         return path.exists()

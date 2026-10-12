@@ -505,7 +505,7 @@ _COVERS_MACHINE_MESSAGES = {
 
 def _spell_cores(cores: float) -> str:
     """Spell a number of cores for a message."""
-    # Not `float.is_integer()`: an `int` satisfies this annotation, and only Python 3.12 gives `int` that
+    # Not `float.is_integer()`: an `int` satisfies this annotation, and before Python 3.12 `int` lacks that
     # method. The remainder answers for both, and a whole number must not print as `64.0 allowed cores`.
     return str(int(cores)) if cores % 1 == 0 else str(cores)
 

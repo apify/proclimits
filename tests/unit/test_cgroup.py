@@ -1195,7 +1195,7 @@ def raise_permission_error(_self: Path) -> bool:
 
 
 def test_exists_on_an_unreadable_level(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Reports a path as missing when the lookup is denied. Only Python 3.14 does that on its own."""
+    """Reports a path as missing when the lookup is denied. From Python 3.14 `Path.exists()` does that on its own."""
     monkeypatch.setattr(Path, 'exists', raise_permission_error)
 
     assert cgroup._exists(tmp_path) is False
