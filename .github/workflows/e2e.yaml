@@ -221,8 +221,9 @@ jobs:
       fail-fast: false
       matrix:
         # The Ubuntu profiles are the only way to reach cgroup v1. The Fedora one runs the same suite on a
-        # second distribution, with a much newer systemd.
-        profile: [ubuntu-v1-hybrid, ubuntu-v1-legacy, fedora-v2]
+        # second distribution, with a much newer systemd. The Debian one runs it on a long-term kernel, older
+        # than any other cgroup v2 lane has.
+        profile: [ubuntu-v1-hybrid, ubuntu-v1-legacy, fedora-v2, debian-v2]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7

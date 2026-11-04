@@ -11,11 +11,12 @@ SSH_PORT=${GUEST_SSH_PORT:-2222}
 GUEST_USER=bench
 
 UBUNTU=https://cloud-images.ubuntu.com/releases/22.04/release
-FEDORA=https://download.fedoraproject.org/pub/fedora/linux/releases/43/Cloud/x86_64/images
+FEDORA=https://download.fedoraproject.org/pub/fedora/linux/releases/45/Cloud/x86_64/images
+DEBIAN=https://cloud.debian.org/images/cloud/trixie
 
 # A profile is one machine to run the suite on: the Ubuntu ones exist for cgroup v1, the Fedora one for a
-# second distribution. Nothing in the suite skips itself, so each profile says by name which tests its machine
-# cannot carry, and everything else has to pass.
+# second distribution and the Debian one for a long-term kernel. Nothing in the suite skips itself, so each
+# profile says by name which tests its machine cannot carry, and everything else has to pass.
 case $PROFILE in
   ubuntu-v1-hybrid | ubuntu-v1-legacy)
     # cgroup v1 cannot be produced on a modern host, and systemd honours the flags below only up to v255.
@@ -43,10 +44,10 @@ case $PROFILE in
     # A second distribution, with a much newer systemd, on the cgroup v2 layout it defaults to. Nothing has to
     # be passed to the kernel, so the image boots through its own bootloader.
     # Fedora publishes no "latest" name, so the build is pinned. Bump it when the release is retired.
-    IMAGE_URL=${GUEST_IMAGE_URL:-$FEDORA/Fedora-Cloud-Base-Generic-43-1.6.x86_64.qcow2}
+    IMAGE_URL=${GUEST_IMAGE_URL:-$FEDORA/Fedora-Cloud-Base-Generic-45-1.4.x86_64.qcow2}
     KERNEL_URL=''
     INITRD_URL=''
-    # podman too: the second machine for the rootless lane, and on a far newer systemd than a hosted runner -
+    # podman too: the second machine for the rootless lane, and on a newer systemd than any hosted runner -
     # which is what decides how much a user manager may delegate.
     PACKAGES='moby-engine podman'
     # A full cgroup v2 machine, so only the cluster tests are out: kind is not installed here.
@@ -57,14 +58,33 @@ case $PROFILE in
     PREPARE='setenforce 0'
     CMDLINE=''
     ;;
+  debian-v2)
+    # The hosted runners and the Fedora guest run the newest kernels. This guest runs 6.12, the long-term
+    # kernel of Debian 13 and of RHEL 10, so cgroup v2 is also checked on a kernel servers run today. Debian
+    # keeps its dated builds, so the build is pinned like Fedora's. The image boots through its own bootloader.
+    IMAGE_URL=${GUEST_IMAGE_URL:-$DEBIAN/20261103-2651/debian-13-genericcloud-amd64-20261103-2651.qcow2}
+    KERNEL_URL=''
+    INITRD_URL=''
+    # Rootless podman reaches the user manager over the user's own D-Bus, which Debian ships separately.
+    # Without it podman falls back to writing cgroups itself, where it may not write, and every limit is lost.
+    PACKAGES='docker.io podman dbus-user-session'
+    # A full cgroup v2 machine, so only the cluster tests are out: kind is not installed here.
+    EXCLUDE='not kubernetes'
+    INTERFACE=cgroup-v2
+    # The user manager started with the first ssh login, before the packages arrived, so it has no bus yet.
+    PREPARE="systemctl restart user@\$(id -u $GUEST_USER).service"
+    CMDLINE=''
+    ;;
   *)
-    echo "guest: GUEST_PROFILE must be ubuntu-v1-hybrid, ubuntu-v1-legacy or fedora-v2" >&2
+    echo "guest: GUEST_PROFILE must be ubuntu-v1-hybrid, ubuntu-v1-legacy, fedora-v2 or debian-v2" >&2
     exit 1
     ;;
 esac
 
 # scp spells the port -P and reads -p as "preserve timestamps", so the two need separate option strings.
-SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+# QEMU accepts the connection itself, so a guest that never reaches sshd leaves ssh waiting for a greeting. The
+# timeout bounds every attempt of the wait loop below.
+SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10"
 KEY=$WORK/id_ed25519
 
 # shellcheck disable=SC2086
@@ -162,13 +182,15 @@ boot_guest() {
     echo "guest: booting $PROFILE"
   fi
 
+  # The network card is virtio, as on a cloud machine. QEMU's default is an emulated e1000, and the cloud
+  # kernel of Debian has no driver for it, so that guest would come up without a network.
   qemu-system-x86_64 \
     -accel "${GUEST_ACCEL:-kvm}" -cpu "$cpu" -m "${GUEST_MEMORY:-4096}" -smp "${GUEST_CPUS:-2}" \
     -display none -serial file:"$WORK/console.log" \
     "${boot[@]}" \
     -drive file="$WORK/run.qcow2",if=virtio,format=qcow2 \
     -drive file="$WORK/seed.img",if=virtio,format=raw \
-    -nic user,hostfwd=tcp::"$SSH_PORT"-:22 \
+    -nic user,model=virtio-net-pci,hostfwd=tcp::"$SSH_PORT"-:22 \
     -pidfile "$WORK/qemu.pid" -daemonize
 }
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import platform
 import subprocess
 import sys
 from itertools import count
@@ -33,6 +34,16 @@ def pytest_sessionstart(session: pytest.Session) -> None:
     wanted = os.environ.get('E2E_PLATFORM')
     if wanted and wanted != sys.platform:
         raise pytest.UsageError(f'this lane declared E2E_PLATFORM={wanted} and is running on {sys.platform}')
+
+
+def pytest_report_header(config: pytest.Config) -> str:
+    """Name the kernel the run got.
+
+    A hosted runner changes its kernel without a commit here, so a log has to say which one a lane ran on.
+    """
+    del config
+
+    return f'kernel: {platform.system()} {platform.release()} {platform.machine()}'
 
 
 @pytest.fixture(scope='session')
