@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import errno
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -17,10 +19,14 @@ from .conftest import (
     V1_SELF_CGROUP,
     V2_MOUNTINFO,
     V2_SELF_CGROUP,
+    fail_to_read,
 )
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+MEMORY_FILES = {'memory.max': '1000\n', 'memory.current': '100\n', 'memory.stat': 'inactive_file 0\n'}
+"""A memory limit at the top of the mount, so a lookup that succeeds locates the memory controller."""
 
 
 def test_read_hierarchies_v2(fake_cgroup: Callable[..., Path]) -> None:
@@ -180,6 +186,7 @@ def test_read_hierarchies_no_unified_when_no_mount_covers(fake_cgroup: Callable[
         limit_level=None,
         unreadable_level=None,
         usage_unreadable_level=None,
+        unlocated_file=None,
     )
 
 
@@ -207,6 +214,7 @@ def test_read_hierarchies_v1_answers_when_no_cgroup2_mount_covers(fake_cgroup: C
         limit_level=str(root / 'memory'),
         unreadable_level=None,
         usage_unreadable_level=None,
+        unlocated_file=None,
     )
 
 
@@ -273,6 +281,213 @@ def test_read_own_paths(
 
     assert unified == expected_unified
     assert controllers == expected_controllers
+
+
+def count_discoveries(monkeypatch: pytest.MonkeyPatch) -> list[None]:
+    """Count the walks over `/proc`, one entry for each lookup that ran discovery rather than reusing it."""
+    read_hierarchies = cgroup._read_hierarchies
+    discoveries: list[None] = []
+
+    def counted() -> cgroup._Hierarchies:
+        discoveries.append(None)
+        return read_hierarchies()
+
+    monkeypatch.setattr(cgroup, '_read_hierarchies', counted)
+
+    return discoveries
+
+
+@pytest.mark.parametrize(
+    ('error', 'reason'),
+    [
+        pytest.param(errno.EMFILE, 'EMFILE', id='the process has no descriptor left'),
+        pytest.param(errno.ENFILE, 'ENFILE', id='the system has no descriptor left'),
+        pytest.param(errno.ENOMEM, 'ENOMEM', id='the kernel has no memory left'),
+        pytest.param(errno.EACCES, 'EACCES', id='the file may not be read'),
+    ],
+)
+@pytest.mark.parametrize('failing', ['_PROC_SELF_CGROUP', '_PROC_SELF_MOUNTINFO'])
+def test_locate_controllers_retries_a_failed_proc_read(
+    fake_cgroup: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    failing: str,
+    error: int,
+    reason: str,
+) -> None:
+    """Names the `/proc` file that failed and why, keeps nothing, and locates on the next lookup."""
+    fake_cgroup(mountinfo=V2_MOUNTINFO, self_cgroup=V2_SELF_CGROUP.format(path='/'), files=MEMORY_FILES)
+    path = getattr(cgroup, failing)
+    fail_to_read(monkeypatch, path, OSError(error, os.strerror(error)), times=1)
+    discoveries = count_discoveries(monkeypatch)
+
+    assert cgroup.locate_controllers() == cgroup.Controllers(
+        interface=None,
+        memory=None,
+        cpu_quota=None,
+        cpu_usage=None,
+        cpu_set=None,
+        unlocated_file=f'{path} ({reason})',
+    )
+    located = cgroup.locate_controllers()
+    assert located.memory is not None
+    # The success is kept, so a third lookup walks nothing.
+    assert cgroup.locate_controllers() == located
+    assert len(discoveries) == 2
+
+
+@pytest.mark.parametrize(
+    'error',
+    [
+        pytest.param(FileNotFoundError(errno.ENOENT, 'No such file or directory'), id='no such file'),
+        pytest.param(NotADirectoryError(errno.ENOTDIR, 'Not a directory'), id='a file where a directory belongs'),
+    ],
+)
+def test_locate_controllers_keeps_an_absent_proc(
+    fake_cgroup: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    error: OSError,
+) -> None:
+    """Keeps a `/proc` that is not there, which lasts as long as the process, and names no file."""
+    fake_cgroup(mountinfo=V2_MOUNTINFO, self_cgroup=V2_SELF_CGROUP.format(path='/'), files=MEMORY_FILES)
+    fail_to_read(monkeypatch, cgroup._PROC_SELF_CGROUP, error, times=3)
+    discoveries = count_discoveries(monkeypatch)
+
+    located_nothing = cgroup.Controllers(
+        interface=None, memory=None, cpu_quota=None, cpu_usage=None, cpu_set=None, unlocated_file=None
+    )
+    assert [cgroup.locate_controllers() for _ in range(3)] == [located_nothing] * 3
+    assert len(discoveries) == 1
+
+
+@pytest.mark.usefixtures('_no_cgroup')
+def test_locate_controllers_keeps_an_absent_proc_out_of_descriptors(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keeps a `/proc` file that is not there where opening it fails for want of file descriptors."""
+    # Out of descriptors, opening a file that is not there fails with EMFILE rather than ENOENT.
+    emfile = OSError(errno.EMFILE, os.strerror(errno.EMFILE))
+    fail_to_read(monkeypatch, cgroup._PROC_SELF_CGROUP, emfile, times=3)
+    discoveries = count_discoveries(monkeypatch)
+
+    located_nothing = cgroup.Controllers(
+        interface=None, memory=None, cpu_quota=None, cpu_usage=None, cpu_set=None, unlocated_file=None
+    )
+    assert [cgroup.locate_controllers() for _ in range(3)] == [located_nothing] * 3
+    assert len(discoveries) == 1
+
+
+@pytest.mark.usefixtures('_no_cgroup')
+def test_locate_controllers_retries_where_a_stat_cannot_tell_absence(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keeps nothing where the open and the stat of a `/proc` file both fail, and locates on the next lookup."""
+    path = cgroup._PROC_SELF_CGROUP
+    stat = Path.stat
+
+    def refuse_stat(self: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+        if self == path:
+            raise PermissionError(errno.EACCES, os.strerror(errno.EACCES))
+        return stat(self, follow_symlinks=follow_symlinks)
+
+    discoveries = count_discoveries(monkeypatch)
+
+    # A refused stat says nothing about whether the file is there. Taken for absence, it would be kept.
+    with monkeypatch.context() as patch:
+        fail_to_read(patch, path, OSError(errno.EMFILE, os.strerror(errno.EMFILE)), times=1)
+        patch.setattr(Path, 'stat', refuse_stat)
+        failed = cgroup.locate_controllers()
+
+    assert failed.unlocated_file == f'{path} (EMFILE)'
+    assert cgroup.locate_controllers().unlocated_file is None
+    assert len(discoveries) == 2
+
+
+def test_locate_controllers_retries_a_value_error(
+    fake_cgroup: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keeps no `ValueError`: content that cannot be read now may be read on the next lookup."""
+    fake_cgroup(mountinfo=V2_MOUNTINFO, self_cgroup=V2_SELF_CGROUP.format(path='/'), files=MEMORY_FILES)
+    path = cgroup._PROC_SELF_CGROUP
+    fail_to_read(monkeypatch, path, ValueError('unreadable content'), times=3)
+    discoveries = count_discoveries(monkeypatch)
+
+    lookups = [cgroup.locate_controllers() for _ in range(3)]
+
+    assert [lookup.unlocated_file for lookup in lookups] == [f'{path} (ValueError)'] * 3
+    assert len(discoveries) == 3
+
+
+def test_locate_controllers_out_of_descriptors(fake_cgroup: Callable[..., Path]) -> None:
+    """Names the file a real descriptor shortage failed, and locates once descriptors are free again."""
+    # A descriptor limit is set through `resource`, which is POSIX.
+    resource = pytest.importorskip('resource')
+    fake_cgroup(mountinfo=V2_MOUNTINFO, self_cgroup=V2_SELF_CGROUP.format(path='/'), files=MEMORY_FILES)
+
+    # Every descriptor below the lowest free one is taken, so a limit there leaves no room for another.
+    lowest_free = os.open(os.devnull, os.O_RDONLY)
+    os.close(lowest_free)
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (lowest_free, hard))
+        failed = cgroup.locate_controllers()
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+
+    assert failed.unlocated_file == f'{cgroup._PROC_SELF_CGROUP} (EMFILE)'
+    assert cgroup.locate_controllers().memory is not None
+
+
+def test_read_memory_names_a_failed_lookup(
+    fake_cgroup: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Names the `/proc` file its own lookup could not read, and names none once a lookup succeeds."""
+    root = fake_cgroup(mountinfo=V2_MOUNTINFO, self_cgroup=V2_SELF_CGROUP.format(path='/'), files=MEMORY_FILES)
+    path = cgroup._PROC_SELF_CGROUP
+    fail_to_read(monkeypatch, path, OSError(errno.EMFILE, os.strerror(errno.EMFILE)), times=1)
+
+    assert cgroup.read_memory() == cgroup.RawMemory(
+        limit=None,
+        used=None,
+        available=None,
+        unflushed_cache=None,
+        limit_level=None,
+        unreadable_level=None,
+        usage_unreadable_level=None,
+        unlocated_file=f'{path} (EMFILE)',
+    )
+    assert cgroup.read_memory() == cgroup.RawMemory(
+        limit=1000,
+        used=100,
+        available=900,
+        unflushed_cache=None,
+        limit_level=str(root),
+        unreadable_level=None,
+        usage_unreadable_level=None,
+        unlocated_file=None,
+    )
+
+
+def test_read_cpu_names_a_failed_lookup(
+    fake_cgroup: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Names the `/proc` file its own lookup could not read, and names none once a lookup succeeds."""
+    root = fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/'),
+        files={'cpu.max': '200000 100000\n', 'cpu.stat': 'usage_usec 0\n'},
+    )
+    path = cgroup._PROC_SELF_CGROUP
+    fail_to_read(monkeypatch, path, OSError(errno.EMFILE, os.strerror(errno.EMFILE)), times=1)
+
+    assert cgroup.read_cpu() == cgroup.RawCpu(
+        quota=None, cpu_set=None, unreadable_level=None, unconvertible_level=None, unlocated_file=f'{path} (EMFILE)'
+    )
+    assert cgroup.read_cpu() == cgroup.RawCpu(
+        quota=cgroup.RawCpuQuota(cores=2.0, limit_level=str(root), usage_level=str(root)),
+        cpu_set=None,
+        unreadable_level=None,
+        unconvertible_level=None,
+        unlocated_file=None,
+    )
 
 
 @pytest.mark.parametrize(
@@ -408,6 +623,7 @@ def test_read_memory_tightest_level(fake_cgroup: Callable[..., Path]) -> None:
         limit_level=str(root / 'kubepods' / 'pod' / 'container'),
         unreadable_level=None,
         usage_unreadable_level=None,
+        unlocated_file=None,
     )
 
 
@@ -439,6 +655,7 @@ def test_read_memory_when_the_tightest_limit_is_not_the_closest(fake_cgroup: Cal
         limit_level=str(root / 'pod' / 'container'),
         unreadable_level=None,
         usage_unreadable_level=None,
+        unlocated_file=None,
     )
 
 
@@ -468,6 +685,7 @@ def test_read_memory_tighter_ancestor(fake_cgroup: Callable[..., Path]) -> None:
         limit_level=str(root / 'kubepods'),
         unreadable_level=None,
         usage_unreadable_level=None,
+        unlocated_file=None,
     )
 
 
@@ -497,6 +715,7 @@ def test_read_memory_smallest_distance(fake_cgroup: Callable[..., Path]) -> None
         limit_level=str(root / 'kubepods' / 'pod'),
         unreadable_level=None,
         usage_unreadable_level=None,
+        unlocated_file=None,
     )
 
 
@@ -524,6 +743,7 @@ def test_read_memory_partial_level(fake_cgroup: Callable[..., Path]) -> None:
         limit_level=str(root / 'kubepods' / 'pod' / 'container'),
         unreadable_level=None,
         usage_unreadable_level=str(root / 'kubepods' / 'pod' / 'container'),
+        unlocated_file=None,
     )
 
 
@@ -580,6 +800,7 @@ def test_read_memory_usage_above_the_limit(fake_cgroup: Callable[..., Path]) -> 
         limit_level=str(root),
         unreadable_level=None,
         usage_unreadable_level=None,
+        unlocated_file=None,
     )
 
 
@@ -610,6 +831,7 @@ def test_read_memory_ancestor_without_usage_files(fake_cgroup: Callable[..., Pat
         limit_level=str(root / 'pod'),
         unreadable_level=None,
         usage_unreadable_level=str(root / 'pod'),
+        unlocated_file=None,
     )
 
 
@@ -629,6 +851,7 @@ def test_read_memory_no_used(fake_cgroup: Callable[..., Path]) -> None:
         limit_level=str(root),
         unreadable_level=None,
         usage_unreadable_level=str(root),
+        unlocated_file=None,
     )
 
 
@@ -654,6 +877,7 @@ def test_read_memory_missing_files(fake_cgroup: Callable[..., Path]) -> None:
         limit_level=str(root / 'pod'),
         unreadable_level=None,
         usage_unreadable_level=None,
+        unlocated_file=None,
     )
 
 
@@ -734,7 +958,7 @@ def test_read_cpu_quota(
     """Reads the CPU bandwidth quota under both cgroup interfaces."""
     fake_cgroup(mountinfo=mountinfo, self_cgroup=self_cgroup, files=files)
 
-    quota = cgroup.read_cpu_quota()
+    quota = cgroup.read_cpu_quota(cgroup.locate_controllers())
 
     assert (quota.cores if quota is not None else None) == expected
 
@@ -782,7 +1006,7 @@ def test_read_cpu_set_size(
     """Counts the cores of a CPU set spelled as a mix of ranges and single numbers."""
     fake_cgroup(mountinfo=mountinfo, self_cgroup=self_cgroup, files=files)
 
-    cpu_set = cgroup.read_cpu_set_size()
+    cpu_set = cgroup.read_cpu_set_size(cgroup.locate_controllers())
 
     assert (cpu_set.cores if cpu_set is not None else None) == expected
 
@@ -836,14 +1060,14 @@ def test_read_cpu_set_size_file_disappears(fake_cgroup: Callable[..., Path]) -> 
         self_cgroup=V2_SELF_CGROUP.format(path='/'),
         files={'cpuset.cpus.effective': '0-1\n'},
     )
-    cpu_set = cgroup.read_cpu_set_size()
+    cpu_set = cgroup.read_cpu_set_size(cgroup.locate_controllers())
 
     assert cpu_set is not None
     assert cpu_set.cores == 2
 
     (root / 'cpuset.cpus.effective').unlink()
 
-    assert cgroup.read_cpu_set_size() is None
+    assert cgroup.read_cpu_set_size(cgroup.locate_controllers()) is None
 
 
 def test_read_cpu_set_size_unreadable_file(fake_cgroup: Callable[..., Path]) -> None:
@@ -858,7 +1082,7 @@ def test_read_cpu_set_size_unreadable_file(fake_cgroup: Callable[..., Path]) -> 
     (root / 'cpuset.cpus.effective').mkdir()
 
     assert cgroup.read_cpu() == cgroup.RawCpu(
-        quota=None, cpu_set=None, unreadable_level=str(root), unconvertible_level=None
+        quota=None, cpu_set=None, unreadable_level=str(root), unconvertible_level=None, unlocated_file=None
     )
 
 
@@ -939,7 +1163,7 @@ def test_cpu_usage_dir_rejects_a_group_of_the_same_name(fake_cgroup: Callable[..
         },
     )
 
-    quota = cgroup.read_cpu_quota()
+    quota = cgroup.read_cpu_quota(cgroup.locate_controllers())
 
     assert quota is not None
     assert quota.cores == 2.0
@@ -970,6 +1194,7 @@ def test_read_memory_unreadable_limit(fake_cgroup: Callable[..., Path]) -> None:
         limit_level=None,
         unreadable_level=str(root / 'pod' / 'container'),
         usage_unreadable_level=None,
+        unlocated_file=None,
     )
 
 
@@ -998,6 +1223,7 @@ def test_read_memory_looser_level_without_usage(fake_cgroup: Callable[..., Path]
         limit_level=str(root / 'pod' / 'container'),
         unreadable_level=None,
         usage_unreadable_level=str(root / 'pod'),
+        unlocated_file=None,
     )
 
 
@@ -1053,6 +1279,7 @@ def test_read_cpu_quota_unreadable_level(fake_cgroup: Callable[..., Path]) -> No
         cpu_set=None,
         unreadable_level=str(root / 'pod' / 'container'),
         unconvertible_level=None,
+        unlocated_file=None,
     )
 
 
@@ -1068,7 +1295,7 @@ def test_read_cpu_set_size_inherited_under_v1(fake_cgroup: Callable[..., Path]) 
         },
     )
 
-    cpu_set = cgroup.read_cpu_set_size()
+    cpu_set = cgroup.read_cpu_set_size(cgroup.locate_controllers())
 
     assert cpu_set is not None
     assert cpu_set.cores == 2
@@ -1083,7 +1310,7 @@ def test_read_cpu_set_size_without_a_counter_of_its_own(fake_cgroup: Callable[..
         files={'cpuset/limited/cpuset.cpus': '0-1\n', 'cpuacct/cpuacct.usage': '5000000000\n'},
     )
 
-    cpu_set = cgroup.read_cpu_set_size()
+    cpu_set = cgroup.read_cpu_set_size(cgroup.locate_controllers())
 
     assert cpu_set is not None
     assert cpu_set.cores == 2
@@ -1102,7 +1329,7 @@ def test_read_cpu_set_size_from_an_ancestor(fake_cgroup: Callable[..., Path]) ->
         },
     )
 
-    cpu_set = cgroup.read_cpu_set_size()
+    cpu_set = cgroup.read_cpu_set_size(cgroup.locate_controllers())
 
     assert cpu_set is not None
     assert cpu_set.cores == 2
@@ -1120,7 +1347,7 @@ def test_read_cpu_set_size_without_any_accounting_hierarchy(fake_cgroup: Callabl
         files={'cpuset/limited/cpuset.cpus': '0-1\n'},
     )
 
-    cpu_set = cgroup.read_cpu_set_size()
+    cpu_set = cgroup.read_cpu_set_size(cgroup.locate_controllers())
 
     assert cpu_set is not None
     assert cpu_set.cores == 2
@@ -1138,7 +1365,7 @@ def test_read_cpu_set_size_across_split_hierarchies(fake_cgroup: Callable[..., P
         },
     )
 
-    cpu_set = cgroup.read_cpu_set_size()
+    cpu_set = cgroup.read_cpu_set_size(cgroup.locate_controllers())
 
     assert cpu_set is not None
     assert cpu_set.limit_level == str(root / 'cpuset' / 'limited')
@@ -1169,6 +1396,7 @@ def test_locate_controllers_hybrid(fake_cgroup: Callable[..., Path]) -> None:
         limit_level=str(root / 'memory'),
         unreadable_level=None,
         usage_unreadable_level=None,
+        unlocated_file=None,
     )
 
 
@@ -1183,9 +1411,14 @@ def test_no_cgroups() -> None:
         limit_level=None,
         unreadable_level=None,
         usage_unreadable_level=None,
+        unlocated_file=None,
     )
-    assert cgroup.read_cpu_quota() is None
-    assert cgroup.read_cpu_set_size() is None
+    # An absent `/proc` is a fact about the system rather than a failed lookup, so no file is named.
+    assert cgroup.read_cpu() == cgroup.RawCpu(
+        quota=None, cpu_set=None, unreadable_level=None, unconvertible_level=None, unlocated_file=None
+    )
+    assert cgroup.read_cpu_quota(cgroup.locate_controllers()) is None
+    assert cgroup.read_cpu_set_size(cgroup.locate_controllers()) is None
     assert cgroup.read_cpu_usage() is None
 
 
@@ -1222,6 +1455,7 @@ def test_locate_controllers_with_unreadable_directories(
         limit_level=None,
         unreadable_level=None,
         usage_unreadable_level=None,
+        unlocated_file=None,
     )
 
 
@@ -1251,7 +1485,7 @@ def test_read_cpu_quota_tightest_level(fake_cgroup: Callable[..., Path]) -> None
     )
 
     # The quota binds on the pod, so a rate has to be measured there rather than in the container.
-    assert cgroup.read_cpu_quota() == cgroup.RawCpuQuota(
+    assert cgroup.read_cpu_quota(cgroup.locate_controllers()) == cgroup.RawCpuQuota(
         cores=1.5,
         limit_level=str(root / 'pod'),
         usage_level=str(root / 'pod'),
@@ -1271,7 +1505,7 @@ def test_read_cpu_quota_on_the_own_group(fake_cgroup: Callable[..., Path]) -> No
         },
     )
 
-    assert cgroup.read_cpu_quota() == cgroup.RawCpuQuota(
+    assert cgroup.read_cpu_quota(cgroup.locate_controllers()) == cgroup.RawCpuQuota(
         cores=1.5,
         limit_level=str(root / 'pod' / 'container'),
         usage_level=str(root / 'pod' / 'container'),
@@ -1322,7 +1556,7 @@ def test_read_cpu_set_size_reads_the_closest_level(fake_cgroup: Callable[..., Pa
         },
     )
 
-    cpu_set = cgroup.read_cpu_set_size()
+    cpu_set = cgroup.read_cpu_set_size(cgroup.locate_controllers())
 
     assert cpu_set is not None
     assert cpu_set.cores == 2
@@ -1367,6 +1601,7 @@ def test_read_memory_limit_of_zero(fake_cgroup: Callable[..., Path]) -> None:
         limit_level=str(root / 'pod' / 'container'),
         unreadable_level=None,
         usage_unreadable_level=None,
+        unlocated_file=None,
     )
 
 
@@ -1393,6 +1628,7 @@ def test_read_memory_usage_below_the_cache(fake_cgroup: Callable[..., Path]) -> 
         limit_level=str(root),
         unreadable_level=None,
         usage_unreadable_level=None,
+        unlocated_file=None,
     )
 
 
@@ -1458,6 +1694,7 @@ def test_read_hierarchies_skips_a_foreign_v1_mount(fake_cgroup: Callable[..., Pa
         limit_level=str(root / 'ours' / 'mine'),
         unreadable_level=None,
         usage_unreadable_level=None,
+        unlocated_file=None,
     )
 
 
@@ -1481,6 +1718,7 @@ def test_read_memory_v1_uses_the_hierarchical_key(fake_cgroup: Callable[..., Pat
         limit_level=str(root / 'memory'),
         unreadable_level=None,
         usage_unreadable_level=None,
+        unlocated_file=None,
     )
 
 
@@ -1499,7 +1737,7 @@ def test_read_cpu_quota_across_split_hierarchies(fake_cgroup: Callable[..., Path
         },
     )
 
-    quota = cgroup.read_cpu_quota()
+    quota = cgroup.read_cpu_quota(cgroup.locate_controllers())
 
     assert quota is not None
     assert quota.cores == 0.5
@@ -1522,7 +1760,7 @@ def test_read_cpu_quota_without_accounting(fake_cgroup: Callable[..., Path]) -> 
         },
     )
 
-    quota = cgroup.read_cpu_quota()
+    quota = cgroup.read_cpu_quota(cgroup.locate_controllers())
 
     assert quota is not None
     assert quota.cores == 0.5
@@ -1561,12 +1799,12 @@ def test_read_cpu_quota_appearing_after_discovery(fake_cgroup: Callable[..., Pat
         },
     )
 
-    assert cgroup.read_cpu_quota() is None
+    assert cgroup.read_cpu_quota(cgroup.locate_controllers()) is None
 
     # The scope of this process is given a quota of its own, below where the chain would have been cut.
     (root / 'slice' / 'own' / 'cpu.max').write_text('50000 100000\n')
 
-    quota = cgroup.read_cpu_quota()
+    quota = cgroup.read_cpu_quota(cgroup.locate_controllers())
 
     assert quota is not None
     assert quota.cores == 0.5
@@ -1595,6 +1833,7 @@ def test_read_memory_dirty_cache_is_not_credited(fake_cgroup: Callable[..., Path
         limit_level=str(root),
         unreadable_level=None,
         usage_unreadable_level=None,
+        unlocated_file=None,
     )
 
 
@@ -1622,6 +1861,7 @@ def test_read_memory_dirty_cache_is_not_credited_v1(fake_cgroup: Callable[..., P
         limit_level=str(root / 'memory'),
         unreadable_level=None,
         usage_unreadable_level=None,
+        unlocated_file=None,
     )
 
 
@@ -1646,6 +1886,7 @@ def test_read_memory_more_waiting_than_inactive_cache(fake_cgroup: Callable[...,
         limit_level=str(root),
         unreadable_level=None,
         usage_unreadable_level=None,
+        unlocated_file=None,
     )
 
 
@@ -1676,6 +1917,7 @@ def test_read_memory_without_the_dirty_keys(fake_cgroup: Callable[..., Path]) ->
         limit_level=str(root / 'memory'),
         unreadable_level=None,
         usage_unreadable_level=None,
+        unlocated_file=None,
     )
 
 
@@ -1699,6 +1941,7 @@ def test_read_memory_dirty_keys_without_the_inactive_cache(fake_cgroup: Callable
         limit_level=str(root),
         unreadable_level=None,
         usage_unreadable_level=str(root),
+        unlocated_file=None,
     )
 
 
@@ -1729,6 +1972,7 @@ def test_read_memory_reports_the_cache_of_the_deciding_level(fake_cgroup: Callab
         limit_level=str(root / 'kubepods' / 'pod'),
         unreadable_level=None,
         usage_unreadable_level=None,
+        unlocated_file=None,
     )
 
 
@@ -1760,6 +2004,7 @@ def test_read_memory_reports_the_cache_of_the_closest_level_on_a_tie(fake_cgroup
         limit_level=str(root / 'kubepods' / 'pod'),
         unreadable_level=None,
         usage_unreadable_level=None,
+        unlocated_file=None,
     )
 
 
@@ -1826,6 +2071,7 @@ def test_read_memory_with_the_dirty_keys_at_zero(fake_cgroup: Callable[..., Path
         limit_level=str(root),
         unreadable_level=None,
         usage_unreadable_level=None,
+        unlocated_file=None,
     )
 
 
@@ -1850,6 +2096,7 @@ def test_read_memory_unparsable_dirty_key(fake_cgroup: Callable[..., Path]) -> N
         limit_level=str(root),
         unreadable_level=None,
         usage_unreadable_level=None,
+        unlocated_file=None,
     )
 
 
@@ -1886,6 +2133,7 @@ def test_read_memory_negative_dirty_key(fake_cgroup: Callable[..., Path]) -> Non
         limit_level=str(root),
         unreadable_level=None,
         usage_unreadable_level=None,
+        unlocated_file=None,
     )
 
 
@@ -1910,4 +2158,5 @@ def test_read_memory_negative_key_beside_a_positive_one(fake_cgroup: Callable[..
         limit_level=str(root),
         unreadable_level=None,
         usage_unreadable_level=None,
+        unlocated_file=None,
     )

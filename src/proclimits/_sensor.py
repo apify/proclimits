@@ -5,7 +5,7 @@ import time
 from dataclasses import dataclass
 
 from . import _backend
-from ._types import Notice, NoticeCode, RawMemory, Source
+from ._types import Notice, NoticeCode, RawCpu, RawMemory, Source
 
 _SHORTEST_WINDOW_SECONDS = 0.01
 """Below this a rate says more about the counter's own resolution than about the load."""
@@ -96,6 +96,9 @@ class Description:
 
     A limit of `None` next to no notice about it means the mechanism was there and nothing limited this
     process in a way that kills it. Only hard limits are read.
+
+    The sources are located after the readings, so beside a `*_METRICS_UNREADABLE` notice they can show what a
+    later lookup found.
     """
 
     memory_budget: MemoryBudget | None
@@ -113,18 +116,21 @@ class Description:
     """
 
     memory_source: Source | None
-    """Where the memory limit and usage are read from. `None` where no mechanism is present."""
+    """Where the memory limit and usage are read from. `None` where no mechanism is present, or where it
+    cannot be located right now."""
 
     cpu_quota_source: Source | None
-    """Where the CPU bandwidth quota is read from. `None` where no mechanism is present."""
+    """Where the CPU bandwidth quota is read from. `None` where no mechanism is present, or where it cannot be
+    located right now."""
 
     cpu_set_source: Source | None
-    """Where the set of allowed cores is read from. `None` where no mechanism is present."""
+    """Where the set of allowed cores is read from. `None` where no mechanism is present, or where it cannot
+    be located right now."""
 
     cpu_usage_source: Source | None
     """Where the consumed CPU time is read from, as a mechanism and not as a level. Which level is counted is
     under `cpu_usage`, and `cpu_rate_level` names where a rate is measured. `None` where no mechanism is
-    present."""
+    present, or where it cannot be located right now."""
 
     raw_memory_limit: int | None
     """The tightest memory limit before filtering. Sentinels included."""
@@ -327,14 +333,13 @@ def describe() -> Description:
     """Explain how the sensor arrives at its readings.
 
     Every reading is taken again, so a limit changed between two calls shows up here. Where the readings come
-    from was discovered once - `clear_cache()` is what forgets that.
+    from was discovered once - `clear_cache()` is what forgets that. A lookup that cannot read `/proc` is not
+    kept.
 
     Returns:
         The readings, the source of each metric, the raw values before filtering, the machine facts, and a
         notice for whatever is worth knowing about them.
     """
-    sources = _backend.sources()
-
     # One read of each filtering fact, here and in the report, so what decided a rejection is the number
     # reported beside it.
     machine_memory = get_machine_memory_bytes()
@@ -342,6 +347,9 @@ def describe() -> Description:
     ceiling = _backend.memory_limit_ceiling()
     memory = _evaluate_memory(ceiling)
     cpu = _evaluate_cpu_limit(machine_cpus)
+
+    # After the readings: a lookup that succeeded is kept, so a limit read above has its source here.
+    sources = _backend.sources()
 
     return Description(
         memory_budget=memory.effective,
@@ -370,8 +378,9 @@ def describe() -> Description:
 def clear_cache() -> None:
     """Forget the discovered metric sources.
 
-    Where a mechanism has anything to discover, it is discovered once and kept. Call this after the process
-    was moved into another group, and the next reading locates the sources again.
+    Where a mechanism has anything to discover, it is discovered once and kept. A lookup that cannot read
+    `/proc` is not kept. Call this after the process was moved into another group, and the next reading
+    locates the sources again.
 
     A child of `fork` clears it on its own, so a pre-fork server whose supervisor puts each worker into a
     group of its own needs no call here.
@@ -590,15 +599,7 @@ def _memory_rejection(raw: RawMemory, ceiling: int | None) -> Notice | None:
     if raw.limit is None:
         # No limit and no mechanism read the same way from the outside, and only one of them is a fact about
         # this machine.
-        return (
-            Notice(
-                code=NoticeCode.MEMORY_METRICS_UNAVAILABLE,
-                message='No mechanism here carries a memory limit, so nothing was read. A Linux machine with '
-                'no cgroup filesystem mounted looks like this, and so does a platform with no backend here.',
-            )
-            if _backend.sources().memory is None
-            else None
-        )
+        return _missing_memory_mechanism(raw)
 
     if ceiling is None:
         return Notice(
@@ -691,15 +692,9 @@ def _evaluate_cpu_limit(machine_cpus: int | None) -> _CpuEvaluation:
     notices = []
     candidates = []
 
-    if not restrictions and _no_cpu_mechanism():
+    if not restrictions and (missing := _missing_cpu_mechanism(raw)) is not None:
         # As for memory: "nothing limits the CPU here" and "nothing here can say" are different answers.
-        notices.append(
-            Notice(
-                code=NoticeCode.CPU_METRICS_UNAVAILABLE,
-                message='No mechanism here carries a CPU limit, so nothing was read. A Linux machine with no '
-                'cgroup filesystem mounted looks like this, and so does a platform with no backend here.',
-            )
-        )
+        notices.append(missing)
 
     for restriction in restrictions:
         # A reading in cores is trusted where the machine core count is unknown: cores have no sentinel, so
@@ -751,11 +746,64 @@ def _no_cpu_limit(notice: Notice) -> _CpuEvaluation:
     )
 
 
-def _no_cpu_mechanism() -> bool:
-    """Whether no mechanism here could carry a CPU limit of either kind."""
+def _missing_memory_mechanism(raw: RawMemory) -> Notice | None:
+    """Say why no source of a memory limit is here: none is present, or none can be located right now.
+
+    `None` where one is.
+    """
+    # A lookup that failed leaves no source either, and says nothing about this machine. The reading's own lookup
+    # decides first, so a lookup that succeeds after it cannot hide the failure.
+    if raw.unlocated_file is not None:
+        return _unlocated_notice(NoticeCode.MEMORY_METRICS_UNREADABLE, 'memory', raw.unlocated_file)
+
+    # The reading's lookup succeeded or found no `/proc`, and either answer is kept, so this one is usually the
+    # same. Another thread can clear the cache in between, and this lookup then looks again and can fail.
     sources = _backend.sources()
 
-    return sources.cpu_quota is None and sources.cpu_set is None
+    if sources.unlocated_file is not None:
+        return _unlocated_notice(NoticeCode.MEMORY_METRICS_UNREADABLE, 'memory', sources.unlocated_file)
+
+    if sources.memory is not None:
+        return None
+
+    return Notice(
+        code=NoticeCode.MEMORY_METRICS_UNAVAILABLE,
+        message='No mechanism here carries a memory limit, so nothing was read. A Linux machine with '
+        'no cgroup filesystem mounted looks like this, and so does a platform with no backend here.',
+    )
+
+
+def _missing_cpu_mechanism(raw: RawCpu) -> Notice | None:
+    """Say why no source of a CPU limit of either kind is here: none is present, or none can be located right now.
+
+    `None` where one is.
+    """
+    # As for memory: the reading's own lookup decides first, and this one can still fail after a cleared cache.
+    if raw.unlocated_file is not None:
+        return _unlocated_notice(NoticeCode.CPU_METRICS_UNREADABLE, 'CPU', raw.unlocated_file)
+
+    sources = _backend.sources()
+
+    if sources.unlocated_file is not None:
+        return _unlocated_notice(NoticeCode.CPU_METRICS_UNREADABLE, 'CPU', sources.unlocated_file)
+
+    if sources.cpu_quota is not None or sources.cpu_set is not None:
+        return None
+
+    return Notice(
+        code=NoticeCode.CPU_METRICS_UNAVAILABLE,
+        message='No mechanism here carries a CPU limit, so nothing was read. A Linux machine with no '
+        'cgroup filesystem mounted looks like this, and so does a platform with no backend here.',
+    )
+
+
+def _unlocated_notice(code: NoticeCode, metric: str, unlocated_file: str) -> Notice:
+    """Say that where a limit would be read from cannot be located, because a file cannot be read."""
+    return Notice(
+        code=code,
+        message=f'Where a {metric} limit would be read from cannot be located, because {unlocated_file} cannot '
+        'be read. Nothing is reported, and the next reading tries again.',
+    )
 
 
 def get_machine_memory_bytes() -> int | None:
