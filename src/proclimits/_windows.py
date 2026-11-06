@@ -314,7 +314,7 @@ _Structure = TypeVar('_Structure', bound=ctypes.Structure)
 _Raw = TypeVar('_Raw', RawMemory, RawCpu)
 
 
-def read_memory(*, throttle_limits: bool = False) -> RawMemory:  # noqa: ARG001
+def read_memory(*, throttle_limits: bool = False, ceiling: int | None = None) -> RawMemory:  # noqa: ARG001
     """Read the memory limit of the job holding this process, with the memory charged against it.
 
     A job can limit the whole job and each of its processes separately. The job-wide limit is reported with
@@ -323,6 +323,7 @@ def read_memory(*, throttle_limits: bool = False) -> RawMemory:  # noqa: ARG001
 
     Args:
         throttle_limits: Ignored. Only the commit limits of a job are read as memory limits.
+        ceiling: Ignored. A job is one level, and the sensor drops a job limit that reaches the ceiling.
     """
     limits, error = _query(_JOB_EXTENDED_LIMIT, _ExtendedLimits)
     if limits is None:
@@ -560,8 +561,8 @@ def _query(info_class: int, structure: type[_Structure]) -> tuple[_Structure | N
 def _job_memory(limit: int) -> RawMemory:
     """Pair a job-wide memory limit with what is charged against it.
 
-    Two calls answer the pair, and either can stand in for the other. Where neither answers, the limit is
-    reported alone.
+    Two calls answer the pair, and either can stand in for the other. Where neither answers, the job is charged
+    zero, the lower bound of a level with nothing read below it.
     """
     charged, error = _job_memory_in_use()
     available = _available_commit()
@@ -572,6 +573,13 @@ def _job_memory(limit: int) -> RawMemory:
     if available is None and charged is not None:
         available = max(limit - charged, 0)
 
+    usage_unreadable_file: str | None = None
+    if charged is None or available is None:
+        # Nothing charged takes two unrelated APIs refusing at once, and has never been seen on a machine. A
+        # job-wide limit does have a usage figure, so this is a guard rather than a path.
+        charged, available = 0, limit
+        usage_unreadable_file = _failed_query(_JOB_LIMIT_VIOLATION, error)
+
     return RawMemory(
         limit=limit,
         used=charged,
@@ -580,9 +588,7 @@ def _job_memory(limit: int) -> RawMemory:
         unflushed_cache=None,
         limit_level=_LEVEL,
         unreadable_file=None,
-        # Nothing charged takes two unrelated APIs refusing at once, and has never been seen on a machine.
-        # A job-wide limit does have a usage figure, so this is a guard rather than a path.
-        usage_unreadable_file=_failed_query(_JOB_LIMIT_VIOLATION, error) if charged is None else None,
+        usage_unreadable_file=usage_unreadable_file,
         unlocated_file=None,
     )
 

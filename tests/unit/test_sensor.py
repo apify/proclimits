@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import os
 import threading
@@ -201,21 +202,19 @@ def test_get_memory_budget_v1_sentinel(fake_cgroup: Callable[..., Path]) -> None
 
 
 def test_get_memory_budget_no_used(fake_cgroup: Callable[..., Path]) -> None:
-    """Drops a limit whose usage did not answer, and calls that a failed read rather than a shape."""
+    """Reports a limit whose usage cannot be read at a lower bound, and names the file and why."""
     root = fake_cgroup(
         mountinfo=V2_MOUNTINFO,
         self_cgroup=V2_SELF_CGROUP.format(path='/'),
         files={'memory.max': '536870912\n', 'memory.current': '1000\n', 'memory.stat': 'anon 600\n'},
     )
 
-    assert proclimits.get_memory_budget() is None
+    # Nothing below the cgroup of this process bounds its charge, so it is charged nothing.
+    assert proclimits.get_memory_budget() == proclimits.MemoryBudget(limit=536870912, used=0, available=536870912)
     assert notice_codes('memory') == ('memory-usage-unreadable',)
-    # The pair that explains the rejection stays visible: a limit next to no usable usage.
-    description = proclimits.describe()
-    assert description.raw_memory_limit == 536870912
-    assert description.raw_memory_used is None
     # The file that went quiet is named with the reason, which is what makes this worth investigating.
-    assert f'{root / "memory.stat"} (has no inactive_file)' in description.notices[0].message
+    (notice,) = proclimits.describe().notices
+    assert f'{root / "memory.stat"} (has no inactive_file)' in notice.message
 
 
 def test_get_memory_budget_usage_the_mechanism_does_not_offer(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1273,8 +1272,8 @@ def test_a_cache_cleared_after_a_reading_is_not_a_missing_mechanism(
     )
     read = getattr(_backend, reading)
 
-    def read_then_clear(**flags: bool) -> _types.RawMemory | _types.RawCpu:
-        raw = read(**flags)
+    def read_then_clear(**options: bool | int | None) -> _types.RawMemory | _types.RawCpu:
+        raw = read(**options)
         # Another thread forgets the discovery here, and the next `/proc` read fails.
         _cgroup.clear_cache()
         fail_the_next_lookup(monkeypatch)
@@ -1796,6 +1795,139 @@ def test_unreadable_limit_beside_a_limit_covering_the_machine(fake_cgroup: Calla
 
     assert proclimits.get_memory_budget() is None
     assert notice_codes('memory') == ('memory-limit-unreadable', 'memory-limit-covers-machine')
+
+
+def test_unreadable_usage_beside_a_limit_covering_the_machine(fake_cgroup: Callable[..., Path]) -> None:
+    """Names no unreadable usage beside a limit dropped for covering the machine, which leaves no budget to bound."""
+    fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/'),
+        files={'memory.max': f'{MACHINE_TOTAL_BYTES * 2}\n', 'memory.current': '100\n', 'memory.stat': 'anon 0\n'},
+    )
+
+    assert proclimits.get_memory_budget() is None
+    assert notice_codes('memory') == ('memory-limit-covers-machine',)
+    assert proclimits.describe().raw_memory_used == 0
+
+
+def test_get_memory_budget_beside_a_usage_nobody_may_read(
+    fake_cgroup: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bounds the charge of a parent whose usage is refused by the own cgroup, and names the file and errno."""
+    root = fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/pod/container'),
+        files={
+            'pod/container/memory.current': '150000000\n',
+            'pod/container/memory.stat': 'inactive_file 50000000\n',
+            'pod/memory.max': '536870912\n',
+            'pod/memory.current': '200000000\n',
+            'pod/memory.stat': 'inactive_file 50000000\n',
+        },
+    )
+    refused = root / 'pod' / 'memory.current'
+    fail_to_read(monkeypatch, refused, OSError(errno.EACCES, os.strerror(errno.EACCES)), times=None)
+
+    description = proclimits.describe()
+
+    # The container is charged 100000000, so the pod is charged at least that.
+    assert description.memory_budget == proclimits.MemoryBudget(limit=536870912, used=100000000, available=436870912)
+    (notice,) = description.notices
+    assert notice.code is proclimits.NoticeCode.MEMORY_USAGE_UNREADABLE
+    assert notice.message == (
+        f'The memory usage in {refused} (EACCES) cannot be read. The used memory reported is a lower bound, and '
+        'the available memory an upper bound.'
+    )
+
+
+def test_get_memory_budget_bounds_a_silent_parent_past_a_limit_left_out(fake_cgroup: Callable[..., Path]) -> None:
+    """Bounds a parent whose usage cannot be read by a level whose limit is left out, and names both files."""
+    root = fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/pod/container'),
+        files={
+            'pod/container/memory.max': 'not a number\n',
+            'pod/container/memory.current': '300\n',
+            'pod/container/memory.stat': 'inactive_file 0\n',
+            'pod/memory.max': '1000\n',
+            'pod/memory.stat': 'inactive_file 0\n',
+        },
+    )
+    (root / 'pod' / 'memory.current').mkdir()
+
+    # The container's limit is left out, and its charge of 300 still bounds the pod's.
+    assert proclimits.get_memory_budget() == proclimits.MemoryBudget(limit=1000, used=300, available=700)
+    assert notice_codes('memory') == ('memory-limit-unreadable', 'memory-usage-unreadable')
+
+
+def test_get_memory_budget_beside_a_silent_level_covering_the_machine(fake_cgroup: Callable[..., Path]) -> None:
+    """Reports the exact budget with no notice where only a level whose limit covers the machine cannot be read."""
+    root = fake_cgroup(
+        mountinfo=V1_MOUNTINFO,
+        self_cgroup=V1_SELF_CGROUP.format(path='/limited'),
+        files={
+            'memory/limited/memory.limit_in_bytes': '536870912\n',
+            'memory/limited/memory.usage_in_bytes': '150000000\n',
+            'memory/limited/memory.stat': 'total_inactive_file 50000000\n',
+            # The cgroup v1 sentinel for "no limit", on a level whose usage cannot be read.
+            'memory/memory.limit_in_bytes': '9223372036854771712\n',
+            'memory/memory.stat': 'total_inactive_file 0\n',
+        },
+    )
+    (root / 'memory' / 'memory.usage_in_bytes').mkdir()
+
+    assert proclimits.get_memory_budget() == proclimits.MemoryBudget(
+        limit=536870912, used=100000000, available=436870912
+    )
+    assert notice_codes('memory') == ()
+
+
+def test_get_memory_budget_bounded_by_a_silent_level_covering_the_machine(fake_cgroup: Callable[..., Path]) -> None:
+    """Reports a bounded budget with a notice where a silent level whose limit covers the machine sets the room."""
+    root = fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/slice/pod/container'),
+        files={
+            'slice/pod/container/memory.max': f'{4 * 1024**3}\n',
+            'slice/pod/container/memory.current': f'{512 * 1024**2}\n',
+            'slice/pod/container/memory.stat': 'inactive_file 0\n',
+            # No limit here, and charged for its other containers too.
+            'slice/pod/memory.current': f'{5 * 1024**3}\n',
+            'slice/pod/memory.stat': 'inactive_file 0\n',
+            'slice/memory.max': f'{MACHINE_TOTAL_BYTES}\n',
+            'slice/memory.stat': 'inactive_file 0\n',
+        },
+    )
+    (root / 'slice' / 'memory.current').mkdir()
+
+    # The slice is charged at least the 5 GiB of the pod, so at most 3 GiB is left there.
+    assert proclimits.get_memory_budget() == proclimits.MemoryBudget(
+        limit=4 * 1024**3, used=1024**3, available=3 * 1024**3
+    )
+    assert notice_codes('memory') == ('memory-usage-unreadable',)
+
+
+def test_get_memory_budget_beside_a_silent_looser_limit(fake_cgroup: Callable[..., Path]) -> None:
+    """Names the unreadable usage of a looser ancestor whose limit restricts, though it does not set the room."""
+    root = fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/pod/container'),
+        files={
+            'pod/container/memory.max': '536870912\n',
+            'pod/container/memory.current': '150000000\n',
+            'pod/container/memory.stat': 'inactive_file 50000000\n',
+            'pod/memory.max': f'{1024**3}\n',
+            'pod/memory.stat': 'inactive_file 0\n',
+        },
+    )
+    (root / 'pod' / 'memory.current').mkdir()
+
+    # The pod is charged at least the 100000000 of the container, which leaves it more room than the container.
+    assert proclimits.get_memory_budget() == proclimits.MemoryBudget(
+        limit=536870912, used=100000000, available=436870912
+    )
+    assert notice_codes('memory') == ('memory-usage-unreadable',)
 
 
 def unreadable_container_quota(fake_cgroup: Callable[..., Path]) -> Path:

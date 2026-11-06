@@ -297,30 +297,27 @@ class _MemoryLevel:
     limit: int
     """The tightest limit counted at that level, in bytes."""
 
-    usage: _MemoryUsage | None
-    """What that level is charged, or `None` when it cannot be read."""
+    usage: _MemoryUsage
+    """What that level is charged. Where its usage cannot be read, a lower bound with no cache."""
 
-    unreadable_usage: str | None
+    usage_unreadable_file: str | None
     """The usage file of that level that cannot be read, and why. `None` where `usage` was read there."""
 
     directory: Path
-    """The cgroup the two were read from."""
+    """The cgroup the limit was read from."""
 
     @property
-    def distance(self) -> int | None:
-        """How far the charge of that level is from its limit, in bytes, or `None` when the usage cannot be read.
+    def distance(self) -> int:
+        """How far the charge of that level is from its limit, in bytes.
 
         Negative while the level sits above its limit.
         """
-        if self.usage is None:
-            return None
-
         return self.limit - self.usage.charged
 
     @property
-    def available(self) -> int | None:
-        """The room left under the limit, in bytes, clamped at zero. `None` when the usage cannot be read."""
-        return None if self.distance is None else max(self.distance, 0)
+    def available(self) -> int:
+        """The room left under the limit, in bytes, clamped at zero."""
+        return max(self.distance, 0)
 
 
 _NO_MEMORY = RawMemory(
@@ -339,7 +336,7 @@ _NO_CPU = RawCpu(quota=None, cpu_set=None, unreadable_file=None, unconvertible_l
 """Nothing read. A reading that fails adds what it could not read."""
 
 
-def read_memory(*, throttle_limits: bool = False) -> RawMemory:
+def read_memory(*, throttle_limits: bool = False, ceiling: int | None = None) -> RawMemory:
     """Read the tightest memory limit along the chain, with a usage that keeps the distance to it.
 
     The kernel acts on the distance to a limit, not on a ratio. The smallest distance to a limit anywhere
@@ -347,14 +344,15 @@ def read_memory(*, throttle_limits: bool = False) -> RawMemory:
     consumer sees one comparable pair.
 
     A limit file that cannot be read is left out, and the reading comes from the files that can. A usage that
-    cannot be read at a level holding a limit leaves no usage to report. The closest limit file and the closest
-    usage file that cannot be read are named.
+    cannot be read is bounded from below. The closest file of each kind that cannot be read is named.
 
     Where a `/proc` file keeps the controller from being located, nothing is read and `unlocated_file` names it.
 
     Args:
         throttle_limits: Whether a level's limit is the tighter of `memory.max` and `memory.high`. cgroup v1
             reads `memory.limit_in_bytes` either way.
+        ceiling: The size at which a limit restricts nothing, in bytes. A level whose limit reaches it is named
+            for an unreadable usage only where it set the distance reported. `None` lets any level be named.
     """
     controllers = locate_controllers()
 
@@ -367,28 +365,27 @@ def read_memory(*, throttle_limits: bool = False) -> RawMemory:
     if controller is None:
         return _NO_MEMORY
 
-    levels, unreadable_limit = _read_memory_levels(controller, throttle_limits=throttle_limits)
+    levels, unreadable_file = _read_memory_levels(controller, throttle_limits=throttle_limits)
     if not levels:
-        return replace(_NO_MEMORY, unreadable_file=unreadable_limit)
+        return replace(_NO_MEMORY, unreadable_file=unreadable_file)
 
     tightest = min(levels, key=lambda level: level.limit)
 
     # Memory is charged up the whole chain. An ancestor counts what its other children use, so its distance can be
-    # smaller than the tightest level's. An unknown distance may be the smallest, so it ranks first and no usage is
-    # reported. Skipping it would promise memory past a limit.
-    min_distance_level = min(levels, key=lambda level: float('-inf') if level.distance is None else level.distance)
+    # smaller than the tightest level's. On a tie a level whose usage was read wins, so its cache is reported.
+    min_distance_level = min(levels, key=lambda level: (level.distance, level.usage_unreadable_file is not None))
 
-    if min_distance_level.usage is None or min_distance_level.available is None:
-        return RawMemory(
-            limit=tightest.limit,
-            used=None,
-            available=None,
-            unflushed_cache=None,
-            limit_level=str(tightest.directory),
-            unreadable_file=unreadable_limit,
-            usage_unreadable_file=min_distance_level.unreadable_usage,
-            unlocated_file=None,
-        )
+    # Levels are listed closest first, so this names the closest level charged at a lower bound. A limit that
+    # reaches the ceiling restricts nothing, so its level is named only where its lower bound set the distance.
+    usage_unreadable_file = next(
+        (
+            level.usage_unreadable_file
+            for level in levels
+            if level.usage_unreadable_file is not None
+            and (ceiling is None or level.limit < ceiling or level is min_distance_level)
+        ),
+        None,
+    )
 
     return RawMemory(
         limit=tightest.limit,
@@ -396,21 +393,17 @@ def read_memory(*, throttle_limits: bool = False) -> RawMemory:
         available=min_distance_level.available,
         unflushed_cache=min_distance_level.usage.unflushed_cache,
         limit_level=str(tightest.directory),
-        unreadable_file=unreadable_limit,
-        usage_unreadable_file=None,
+        unreadable_file=unreadable_file,
+        usage_unreadable_file=usage_unreadable_file,
         unlocated_file=None,
     )
 
 
-def _read_memory_levels(
-    controller: Controller,
-    *,
-    throttle_limits: bool,
-) -> tuple[list[_MemoryLevel], str | None]:
-    """Read the limit and the usage of every level along the chain that holds a limit.
+def _read_memory_levels(controller: Controller, *, throttle_limits: bool) -> tuple[list[_MemoryLevel], str | None]:
+    """Read the limit and the charge of every level along the chain that holds a limit.
 
-    A level with no readable usage is kept: its limit still caps everything below it. Each limit file that cannot
-    be read is left out. A level drops out only where none of its limit files holds a limit that can be read.
+    Each limit file that cannot be read is left out. A level drops out only where none of its limit files holds
+    a limit that can be read.
 
     Returns:
         The levels, closest first, and the closest limit file that cannot be read, with the reason.
@@ -420,8 +413,8 @@ def _read_memory_levels(
     if throttle_limits and controller.names.memory_throttle_limit is not None:
         limit_files.append(controller.names.memory_throttle_limit)
 
-    levels = []
-    unreadable_limit: str | None = None
+    limits: dict[Path, int] = {}
+    unreadable_file: str | None = None
 
     for directory in controller.dirs:
         # `mem_cgroup_wb_stats` in mm/memcontrol.c takes `min(memory.max, memory.high)` as the ceiling of each
@@ -431,27 +424,73 @@ def _read_memory_levels(
         for name in limit_files:
             try:
                 limit = _read_memory_limit(directory / name)
-            except _UnreadableFileError as unreadable:
-                unreadable_limit = unreadable_limit or str(unreadable)
+            except _UnreadableFileError as error:
+                unreadable_file = unreadable_file or str(error)
                 continue
 
             if limit is not None:
                 found.append(limit)
 
-        if not found:
+        if found:
+            limits[directory] = min(found)
+
+    return _charge_levels(controller, limits), unreadable_file
+
+
+def _charge_levels(controller: Controller, limits: dict[Path, int]) -> list[_MemoryLevel]:
+    """Pair each limit with what its level is charged, closest level first.
+
+    A level whose usage cannot be read keeps its limit. It is charged the largest charge read at any level below
+    it, the cgroup of this process included, or zero where none was read.
+    """
+    levels = []
+    # `floor` is the largest charge read below the level at hand. `unread` holds the levels without a readable limit.
+    # Only those passed since the last charge was read are kept. A charge read already covers everything below it, so
+    # only these can still raise the bound. They are read only once a level above them needs one, so a chain whose usage
+    # answers everywhere reads only the levels holding a limit.
+    floor = 0
+    unread: list[Path] = []
+
+    for directory in controller.dirs:
+        limit = limits.get(directory)
+        if limit is None:
+            unread.append(directory)
             continue
 
         try:
             usage = _read_memory_usage(controller, directory)
-        except _UnreadableFileError as unreadable:
+        except _UnreadableFileError as error:
+            # Memory is charged up the chain, so a level is charged at least what any level below it is. The chain
+            # logic assumes that of cgroup v1 too. The reads are not atomic: memory freed between two of them can
+            # put the bound briefly above the real charge. Where this level sets the room, that raises `used` and
+            # lowers `available`. Measured on cgroup v2 with a churning child alone under its parent: up to about
+            # 30 MiB, in about 3 samples of 10,000. With a busy sibling under the same parent: none in 640,000.
+            for below in unread:
+                floor = max(floor, _read_charge(controller, below))
+            unread.clear()
             levels.append(
-                _MemoryLevel(limit=min(found), usage=None, unreadable_usage=str(unreadable), directory=directory)
+                _MemoryLevel(
+                    limit=limit,
+                    usage=_MemoryUsage(charged=floor, unflushed_cache=None),
+                    usage_unreadable_file=str(error),
+                    directory=directory,
+                )
             )
             continue
 
-        levels.append(_MemoryLevel(limit=min(found), usage=usage, unreadable_usage=None, directory=directory))
+        floor = max(floor, usage.charged)
+        unread.clear()
+        levels.append(_MemoryLevel(limit=limit, usage=usage, usage_unreadable_file=None, directory=directory))
 
-    return levels, unreadable_limit
+    return levels
+
+
+def _read_charge(controller: Controller, directory: Path) -> int:
+    """Read what one cgroup is charged, in bytes. Zero where it cannot be read."""
+    try:
+        return _read_memory_usage(controller, directory).charged
+    except _UnreadableFileError:
+        return 0
 
 
 def _read_memory_limit(path: Path) -> int | None:
@@ -939,7 +978,7 @@ def _read_memory_usage(controller: Controller, directory: Path) -> _MemoryUsage:
     writeback = stat.get(names.file_writeback)
 
     # Where neither key is usable, the whole inactive cache is credited. Cgroup v1 before 3.12 carries neither.
-    # Dropping the usage there would send a consumer to the memory of the machine.
+    # Dropping the usage there would leave only a lower bound of the charge on such a kernel.
     #
     # One key is enough. Cgroup v1 has `total_writeback` from 3.12 but `total_dirty` only from 4.2.
     # Each key is clamped on its own, so a negative counter cannot cancel the other.

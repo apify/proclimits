@@ -866,7 +866,7 @@ def test_read_memory_smallest_distance(fake_cgroup: Callable[..., Path]) -> None
 
 
 def test_read_memory_partial_level(fake_cgroup: Callable[..., Path]) -> None:
-    """Reports the ceiling without a usage when the tightest level has none to pair with it."""
+    """Charges the tightest level nothing where its usage cannot be read and no level below it can be."""
     root = fake_cgroup(
         mountinfo=V2_MOUNTINFO,
         self_cgroup=V2_SELF_CGROUP.format(path='/kubepods/pod/container'),
@@ -881,10 +881,11 @@ def test_read_memory_partial_level(fake_cgroup: Callable[..., Path]) -> None:
         },
     )
 
+    # The container is the cgroup of this process, so nothing below it bounds its charge.
     assert cgroup.read_memory() == cgroup.RawMemory(
         limit=1000,
-        used=None,
-        available=None,
+        used=0,
+        available=1000,
         unflushed_cache=None,
         limit_level=str(root / 'kubepods' / 'pod' / 'container'),
         unreadable_file=None,
@@ -951,14 +952,15 @@ def test_read_memory_usage_above_the_limit(fake_cgroup: Callable[..., Path]) -> 
 
 
 def test_read_memory_ancestor_without_usage_files(fake_cgroup: Callable[..., Path]) -> None:
-    """Counts an ancestor's limit towards the ceiling even when its own usage cannot be read at all."""
+    """Charges an ancestor whose usage cannot be read what the limited level below it is charged."""
     root = fake_cgroup(
         mountinfo=V2_MOUNTINFO,
         self_cgroup=V2_SELF_CGROUP.format(path='/pod/container'),
         files={
             'pod/container/memory.max': '1000\n',
             'pod/container/memory.current': '100\n',
-            'pod/container/memory.stat': 'inactive_file 0\n',
+            # The waiting cache of the container, which is not the level that decides below.
+            'pod/container/memory.stat': 'inactive_file 0\nfile_dirty 5\n',
             # The tightest limit sits on the ancestor, whose usage will not read.
             'pod/memory.max': '500\n',
             'pod/memory.stat': 'inactive_file 0\n',
@@ -968,11 +970,11 @@ def test_read_memory_ancestor_without_usage_files(fake_cgroup: Callable[..., Pat
     # usage file beside it, so the figure goes missing by failing to read rather than by being absent.
     (root / 'pod' / 'memory.current').mkdir()
 
-    # The tightest limit is the ancestor's, and nothing says how close it is to it.
+    # The tightest limit is the ancestor's. It is charged at least the 100 of the container, so 400 is left.
     assert cgroup.read_memory() == cgroup.RawMemory(
         limit=500,
-        used=None,
-        available=None,
+        used=100,
+        available=400,
         unflushed_cache=None,
         limit_level=str(root / 'pod'),
         unreadable_file=None,
@@ -982,7 +984,7 @@ def test_read_memory_ancestor_without_usage_files(fake_cgroup: Callable[..., Pat
 
 
 def test_read_memory_no_used(fake_cgroup: Callable[..., Path]) -> None:
-    """Reports a limit that no usage can be paired with as-is, leaving the judgement to the sensor layer."""
+    """Charges a lone level nothing where its usage cannot be read, and names the file."""
     root = fake_cgroup(
         mountinfo=V2_MOUNTINFO,
         self_cgroup=V2_SELF_CGROUP.format(path='/'),
@@ -991,8 +993,8 @@ def test_read_memory_no_used(fake_cgroup: Callable[..., Path]) -> None:
 
     assert cgroup.read_memory() == cgroup.RawMemory(
         limit=536870912,
-        used=None,
-        available=None,
+        used=0,
+        available=536870912,
         unflushed_cache=None,
         limit_level=str(root),
         unreadable_file=None,
@@ -1438,7 +1440,7 @@ def test_read_memory_unreadable_limit(
 
 
 def test_read_memory_looser_level_without_usage(fake_cgroup: Callable[..., Path]) -> None:
-    """Drops the working set for an unread usage on a looser level, which can still be the closest to its limit."""
+    """Bounds the unread usage of a looser level by the level below, and keeps the room the closer level reads."""
     root = fake_cgroup(
         mountinfo=V2_MOUNTINFO,
         self_cgroup=V2_SELF_CGROUP.format(path='/pod/container'),
@@ -1454,10 +1456,12 @@ def test_read_memory_looser_level_without_usage(fake_cgroup: Callable[..., Path]
     )
     (root / 'pod' / 'memory.current').mkdir()
 
-    assert cgroup.read_memory() == cgroup.RawMemory(
+    # The pod is charged at least the 100 of the container, which leaves it 900 against the container's 400. Its
+    # limit is below the ceiling, so its usage is named though it does not set the room.
+    assert cgroup.read_memory(ceiling=16 * 1024**3) == cgroup.RawMemory(
         limit=500,
-        used=None,
-        available=None,
+        used=100,
+        available=400,
         unflushed_cache=None,
         limit_level=str(root / 'pod' / 'container'),
         unreadable_file=None,
@@ -2262,8 +2266,8 @@ def test_read_memory_dirty_keys_without_the_inactive_cache(fake_cgroup: Callable
 
     assert cgroup.read_memory() == cgroup.RawMemory(
         limit=1000,
-        used=None,
-        available=None,
+        used=0,
+        available=1000,
         unflushed_cache=None,
         limit_level=str(root),
         unreadable_file=None,
@@ -2355,8 +2359,8 @@ def test_read_memory_reads_the_stat_file_once_per_level(
 
     read = record_reads(monkeypatch, '_read_stat_values', '_read_number')
 
-    # Only that a reading happened matters here.
-    assert cgroup.read_memory().used is not None
+    # The container is charged 900 less a credit of 300, and its 400 left is the smaller room of the two.
+    assert cgroup.read_memory().used == 600
 
     # Two levels, so this pins one parse per level rather than one parse in total. Whole paths, because both
     # levels name the file `memory.stat`.
@@ -2504,6 +2508,155 @@ def test_read_memory_no_readable_limit(fake_cgroup: Callable[..., Path]) -> None
     )
 
 
+def test_read_memory_bounds_a_silent_parent_by_the_own_cgroup(fake_cgroup: Callable[..., Path]) -> None:
+    """Charges a parent whose usage cannot be read at least what the cgroup of this process is charged."""
+    root = fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/pod/container'),
+        files={
+            # The cgroup of this process holds no limit, and its usage reads.
+            'pod/container/memory.current': '300\n',
+            'pod/container/memory.stat': 'inactive_file 50\n',
+            'pod/memory.max': '1000\n',
+            'pod/memory.stat': 'inactive_file 0\n',
+        },
+    )
+    (root / 'pod' / 'memory.current').mkdir()
+
+    # The container is charged 250, so the pod is charged at least that.
+    assert cgroup.read_memory() == cgroup.RawMemory(
+        limit=1000,
+        used=250,
+        available=750,
+        unflushed_cache=None,
+        limit_level=str(root / 'pod'),
+        unreadable_file=None,
+        usage_unreadable_file=f'{root / "pod" / "memory.current"} ({OPENING_A_DIRECTORY})',
+        unlocated_file=None,
+    )
+
+
+def test_read_memory_bound_takes_the_largest_charge_below(fake_cgroup: Callable[..., Path]) -> None:
+    """Bounds a silent level by the largest charge read anywhere below it, limited or not."""
+    root = fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/kubepods/pod/container'),
+        files={
+            'kubepods/pod/container/memory.max': '2000\n',
+            'kubepods/pod/container/memory.current': '300\n',
+            'kubepods/pod/container/memory.stat': 'inactive_file 0\n',
+            # No limit here, and more charged than the container, because a sibling container is charged too.
+            'kubepods/pod/memory.current': '400\n',
+            'kubepods/pod/memory.stat': 'inactive_file 0\n',
+            'kubepods/memory.max': '1000\n',
+            'kubepods/memory.stat': 'inactive_file 0\n',
+        },
+    )
+    (root / 'kubepods' / 'memory.current').mkdir()
+
+    assert cgroup.read_memory() == cgroup.RawMemory(
+        limit=1000,
+        used=400,
+        available=600,
+        unflushed_cache=None,
+        limit_level=str(root / 'kubepods'),
+        unreadable_file=None,
+        usage_unreadable_file=f'{root / "kubepods" / "memory.current"} ({OPENING_A_DIRECTORY})',
+        unlocated_file=None,
+    )
+
+
+def test_read_memory_bound_takes_the_largest_charge_of_several_unlimited_levels(
+    fake_cgroup: Callable[..., Path],
+) -> None:
+    """Bounds a silent level by the largest charge among the levels below it that hold no limit, not the closest."""
+    root = fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/kubepods/pod/container'),
+        files={
+            # Neither level below holds a limit, and the one further from this process is charged more.
+            'kubepods/pod/container/memory.current': '300\n',
+            'kubepods/pod/container/memory.stat': 'inactive_file 0\n',
+            'kubepods/pod/memory.current': '400\n',
+            'kubepods/pod/memory.stat': 'inactive_file 0\n',
+            'kubepods/memory.max': '1000\n',
+            'kubepods/memory.stat': 'inactive_file 0\n',
+        },
+    )
+    (root / 'kubepods' / 'memory.current').mkdir()
+
+    assert cgroup.read_memory() == cgroup.RawMemory(
+        limit=1000,
+        used=400,
+        available=600,
+        unflushed_cache=None,
+        limit_level=str(root / 'kubepods'),
+        unreadable_file=None,
+        usage_unreadable_file=f'{root / "kubepods" / "memory.current"} ({OPENING_A_DIRECTORY})',
+        unlocated_file=None,
+    )
+
+
+def test_read_memory_bound_keeps_a_larger_charge_read_further_down(fake_cgroup: Callable[..., Path]) -> None:
+    """Bounds a silent level by the largest charge read below it, not by the charge of the level right below it."""
+    root = fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/kubepods/pod/container'),
+        files={
+            'kubepods/pod/container/memory.max': '2000\n',
+            'kubepods/pod/container/memory.current': '400\n',
+            'kubepods/pod/container/memory.stat': 'inactive_file 0\n',
+            # Charged less than the container below it, as two reads a moment apart can be.
+            'kubepods/pod/memory.max': '3000\n',
+            'kubepods/pod/memory.current': '300\n',
+            'kubepods/pod/memory.stat': 'inactive_file 0\n',
+            'kubepods/memory.max': '1000\n',
+            'kubepods/memory.stat': 'inactive_file 0\n',
+        },
+    )
+    (root / 'kubepods' / 'memory.current').mkdir()
+
+    assert cgroup.read_memory() == cgroup.RawMemory(
+        limit=1000,
+        used=400,
+        available=600,
+        unflushed_cache=None,
+        limit_level=str(root / 'kubepods'),
+        unreadable_file=None,
+        usage_unreadable_file=f'{root / "kubepods" / "memory.current"} ({OPENING_A_DIRECTORY})',
+        unlocated_file=None,
+    )
+
+
+def test_read_memory_bound_reads_past_a_level_that_cannot_be_read(fake_cgroup: Callable[..., Path]) -> None:
+    """Counts a level below whose usage cannot be read as zero, and keeps the charge read below that."""
+    root = fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/kubepods/pod/container'),
+        files={
+            'kubepods/pod/container/memory.current': '300\n',
+            'kubepods/pod/container/memory.stat': 'inactive_file 0\n',
+            # No limit here, and no usage to bound the level above with.
+            'kubepods/pod/memory.stat': 'inactive_file 0\n',
+            'kubepods/memory.max': '1000\n',
+            'kubepods/memory.stat': 'inactive_file 0\n',
+        },
+    )
+    (root / 'kubepods' / 'pod' / 'memory.current').mkdir()
+    (root / 'kubepods' / 'memory.current').mkdir()
+
+    assert cgroup.read_memory() == cgroup.RawMemory(
+        limit=1000,
+        used=300,
+        available=700,
+        unflushed_cache=None,
+        limit_level=str(root / 'kubepods'),
+        unreadable_file=None,
+        usage_unreadable_file=f'{root / "kubepods" / "memory.current"} ({OPENING_A_DIRECTORY})',
+        unlocated_file=None,
+    )
+
+
 @pytest.mark.parametrize(
     ('files', 'name', 'reason'),
     [
@@ -2566,6 +2719,94 @@ def test_read_memory_names_an_absent_usage_file_out_of_descriptors(
     assert cgroup.read_memory().usage_unreadable_file == f'{root / "pod" / name} (absent)'
 
 
+def test_read_memory_silent_level_between_two_that_answer(fake_cgroup: Callable[..., Path]) -> None:
+    """Lets a level above a silent one set the room where it is the closest to its limit."""
+    root = fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/kubepods/pod/container'),
+        files={
+            'kubepods/pod/container/memory.max': '500\n',
+            'kubepods/pod/container/memory.current': '100\n',
+            'kubepods/pod/container/memory.stat': 'inactive_file 0\n',
+            'kubepods/pod/memory.max': '1000\n',
+            'kubepods/pod/memory.stat': 'inactive_file 0\n',
+            'kubepods/memory.max': '2000\n',
+            'kubepods/memory.current': '1950\n',
+            'kubepods/memory.stat': 'inactive_file 0\nfile_dirty 7\n',
+        },
+    )
+    (root / 'kubepods' / 'pod' / 'memory.current').mkdir()
+
+    # 400 left at the container, at least 900 at the pod, and 50 at kubepods.
+    assert cgroup.read_memory() == cgroup.RawMemory(
+        limit=500,
+        used=450,
+        available=50,
+        unflushed_cache=7,
+        limit_level=str(root / 'kubepods' / 'pod' / 'container'),
+        unreadable_file=None,
+        usage_unreadable_file=f'{root / "kubepods" / "pod" / "memory.current"} ({OPENING_A_DIRECTORY})',
+        unlocated_file=None,
+    )
+
+
+def test_read_memory_reads_a_level_without_a_limit_only_for_a_bound(
+    fake_cgroup: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reads the usage of a level holding no limit only where a level above it cannot be read."""
+    root = fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/pod/container'),
+        files={
+            'pod/container/memory.current': '300\n',
+            'pod/container/memory.stat': 'inactive_file 0\n',
+            'pod/memory.max': '1000\n',
+            'pod/memory.current': '400\n',
+            'pod/memory.stat': 'inactive_file 0\n',
+        },
+    )
+    read = record_reads(monkeypatch, '_read_number')
+    own_usage = root / 'pod' / 'container' / 'memory.current'
+
+    assert cgroup.read_memory().used == 400
+    assert own_usage not in read
+
+    (root / 'pod' / 'memory.current').unlink()
+    (root / 'pod' / 'memory.current').mkdir()
+
+    assert cgroup.read_memory().used == 300
+    assert own_usage in read
+
+
+def test_read_memory_bound_skips_the_levels_below_a_charge_read(
+    fake_cgroup: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bounds a silent level by a charge read below it, without reading the levels under that one."""
+    root = fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/kubepods/pod/container'),
+        files={
+            'kubepods/pod/container/memory.current': '300\n',
+            'kubepods/pod/container/memory.stat': 'inactive_file 0\n',
+            'kubepods/pod/memory.max': '1000\n',
+            'kubepods/pod/memory.current': '400\n',
+            'kubepods/pod/memory.stat': 'inactive_file 0\n',
+            # Tighter than the pod, so the bound sets the room: at least 400 charged leaves at most 500.
+            'kubepods/memory.max': '900\n',
+            'kubepods/memory.stat': 'inactive_file 0\n',
+        },
+    )
+    (root / 'kubepods' / 'memory.current').mkdir()
+    read = record_reads(monkeypatch, '_read_number')
+
+    # The pod is charged 400, which already covers the container below it.
+    assert cgroup.read_memory().used == 400
+    assert root / 'kubepods' / 'pod' / 'memory.current' in read
+    assert root / 'kubepods' / 'pod' / 'container' / 'memory.current' not in read
+
+
 def test_read_memory_names_the_closest_silent_usage(fake_cgroup: Callable[..., Path]) -> None:
     """Names the usage file of the closest level when two levels holding a limit cannot be read."""
     root = fake_cgroup(
@@ -2583,6 +2824,126 @@ def test_read_memory_names_the_closest_silent_usage(fake_cgroup: Callable[..., P
 
     expected = f'{root / "pod" / "container" / "memory.current"} ({OPENING_A_DIRECTORY})'
     assert cgroup.read_memory().usage_unreadable_file == expected
+
+
+def test_read_memory_names_no_usage_at_a_level_reaching_the_ceiling(fake_cgroup: Callable[..., Path]) -> None:
+    """Names no unreadable usage at a level whose limit reaches the ceiling."""
+    root = fake_cgroup(
+        mountinfo=V1_MOUNTINFO,
+        self_cgroup=V1_SELF_CGROUP.format(path='/limited'),
+        files={
+            'memory/limited/memory.limit_in_bytes': '536870912\n',
+            'memory/limited/memory.usage_in_bytes': '104857600\n',
+            'memory/limited/memory.stat': 'total_inactive_file 0\n',
+            # How cgroup v1 spells "no limit", on a level whose usage cannot be read.
+            'memory/memory.limit_in_bytes': '9223372036854771712\n',
+            'memory/memory.stat': 'total_inactive_file 0\n',
+        },
+    )
+    (root / 'memory' / 'memory.usage_in_bytes').mkdir()
+
+    # The own group sets the room, and its usage was read, so the reading is exact.
+    assert cgroup.read_memory(ceiling=16 * 1024**3) == cgroup.RawMemory(
+        limit=536870912,
+        used=104857600,
+        available=432013312,
+        unflushed_cache=None,
+        limit_level=str(root / 'memory' / 'limited'),
+        unreadable_file=None,
+        usage_unreadable_file=None,
+        unlocated_file=None,
+    )
+    # Without a ceiling the sentinel cannot be told from a limit, so its usage is named.
+    expected = f'{root / "memory" / "memory.usage_in_bytes"} ({OPENING_A_DIRECTORY})'
+    assert cgroup.read_memory().usage_unreadable_file == expected
+
+
+@pytest.mark.parametrize(
+    'ceiling',
+    [
+        pytest.param(1500, id='closer limit above the ceiling'),
+        pytest.param(2000, id='closer limit at the ceiling'),
+    ],
+)
+def test_read_memory_names_a_farther_usage_past_a_level_reaching_the_ceiling(
+    fake_cgroup: Callable[..., Path],
+    ceiling: int,
+) -> None:
+    """Names the usage of a farther level whose limit counts, past a closer one whose limit reaches the ceiling."""
+    root = fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/pod/container'),
+        files={
+            'pod/container/memory.max': '2000\n',
+            'pod/container/memory.stat': 'inactive_file 0\n',
+            'pod/memory.max': '1000\n',
+            'pod/memory.stat': 'inactive_file 0\n',
+        },
+    )
+    (root / 'pod' / 'container' / 'memory.current').mkdir()
+    (root / 'pod' / 'memory.current').mkdir()
+
+    expected = f'{root / "pod" / "memory.current"} ({OPENING_A_DIRECTORY})'
+    assert cgroup.read_memory(ceiling=ceiling).usage_unreadable_file == expected
+
+
+def test_read_memory_names_a_level_reaching_the_ceiling_that_sets_the_room(fake_cgroup: Callable[..., Path]) -> None:
+    """Names the usage of a level whose limit reaches the ceiling where its lower bound sets the room."""
+    root = fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/slice/pod/container'),
+        files={
+            'slice/pod/container/memory.max': '800\n',
+            'slice/pod/container/memory.current': '100\n',
+            'slice/pod/container/memory.stat': 'inactive_file 0\n',
+            # No limit here, and charged for its other containers too.
+            'slice/pod/memory.current': '1000\n',
+            'slice/pod/memory.stat': 'inactive_file 0\n',
+            'slice/memory.max': '1600\n',
+            'slice/memory.stat': 'inactive_file 0\n',
+        },
+    )
+    (root / 'slice' / 'memory.current').mkdir()
+
+    # 700 left at the container, and at most 600 at the slice, which is charged at least the 1000 of the pod.
+    assert cgroup.read_memory(ceiling=1600) == cgroup.RawMemory(
+        limit=800,
+        used=200,
+        available=600,
+        unflushed_cache=None,
+        limit_level=str(root / 'slice' / 'pod' / 'container'),
+        unreadable_file=None,
+        usage_unreadable_file=f'{root / "slice" / "memory.current"} ({OPENING_A_DIRECTORY})',
+        unlocated_file=None,
+    )
+
+
+def test_read_memory_prefers_a_read_level_on_a_tie(fake_cgroup: Callable[..., Path]) -> None:
+    """Lets a level whose usage was read set the room on a tie, so its waiting cache is reported."""
+    root = fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/pod/container'),
+        files={
+            'pod/container/memory.max': '500\n',
+            'pod/container/memory.stat': 'inactive_file 0\n',
+            'pod/memory.max': '1000\n',
+            'pod/memory.current': '500\n',
+            'pod/memory.stat': 'inactive_file 0\nfile_dirty 3\n',
+        },
+    )
+    (root / 'pod' / 'container' / 'memory.current').mkdir()
+
+    # 500 left at the container, charged nothing for want of a level below it, and 500 left at the pod.
+    assert cgroup.read_memory() == cgroup.RawMemory(
+        limit=500,
+        used=0,
+        available=500,
+        unflushed_cache=3,
+        limit_level=str(root / 'pod' / 'container'),
+        unreadable_file=None,
+        usage_unreadable_file=f'{root / "pod" / "container" / "memory.current"} ({OPENING_A_DIRECTORY})',
+        unlocated_file=None,
+    )
 
 
 def test_read_cpu_quota_names_the_closest_unreadable_file(fake_cgroup: Callable[..., Path]) -> None:

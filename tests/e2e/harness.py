@@ -133,13 +133,15 @@ INFORMATIONAL_NOTICES = frozenset(
         'cpu-ancestors-hidden',
         'memory-limit-unreadable',
         'cpu-limit-unreadable',
+        'memory-usage-unreadable',
     }
 )
 """Notices that report what a reading could not see or read, rather than why it is missing.
 
 The `*_ANCESTORS_HIDDEN` pair follows from the shape of the mount. The `*_LIMIT_UNREADABLE` pair names a limit
-left out of a reading made from the rest, and where that leaves nothing reported, the raw values are `None` too.
-So none of them explains a `None` beside a raw value. Kept apart because the check that a missing reading was
+left out of a reading made from the rest, and where that leaves nothing read, the raw values are `None` too.
+`memory-usage-unreadable` names a usage bounded rather than read, and comes only beside a reported budget. So
+none of them explains a `None` beside a raw value. Kept apart because the check that a missing reading was
 explained would otherwise be satisfied by a notice that explains something else - and on a truncated mount,
 which is a shape the container lane builds, it would be satisfied every time.
 """
@@ -708,7 +710,8 @@ def check_invariants(reading: Reading) -> None:
     if reading.memory_limit is not None:
         assert reading.used is not None
         # The probe charged this much before reading, whichever mechanism counts it, so anything below it
-        # is not the memory of this process.
+        # is not the memory of this process. No exception is made for `memory-usage-unreadable`: a lane that
+        # builds an own cgroup whose usage cannot be read is meant to fail here, loudly.
         assert reading.allocated <= reading.used <= reading.memory_limit
         assert reading.machine_memory_bytes is not None
         # Against the ceiling rather than the memory of the machine: a job limits commit, and a limit above

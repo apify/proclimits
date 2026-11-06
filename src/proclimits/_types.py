@@ -32,7 +32,10 @@ class NoticeCode(str, Enum):
     """
 
     MEMORY_USAGE_UNREADABLE = 'memory-usage-unreadable'
-    """A limit was found, and the level that carries the usage to pair with it did not answer.
+    """A level holds a memory limit, and its usage cannot be read.
+
+    The budget is still reported. That level is charged at least what the levels below it are, so `used` is a
+    lower bound and `available` an upper bound.
 
     The message names the file and the reason, or on Windows the job query and its error code.
 
@@ -197,20 +200,21 @@ class RawMemory:
     used: int | None
     """The memory charged against `limit`, in bytes, as the mechanism derives it.
 
-    `None` where any level holding a limit did not answer with a usage, not only the level holding `limit`.
-    `None` too where the mechanism pairs no usage with a limit of that kind.
+    A lower bound where `usage_unreadable_file` is set. `None` where the mechanism pairs no usage with a limit
+    of that kind.
     """
 
     available: int | None
     """The distance to the limit, in bytes, as the mechanism reports it.
 
-    Filled with `used` and `None` with it: the two are the pair a limit is reported against.
+    Filled with `used` and `None` with it: the two are the pair a limit is reported against. An upper bound
+    where `usage_unreadable_file` is set.
     """
 
     unflushed_cache: int | None
     """The pages waiting to be written to disk, in bytes, at the level whose distance set `available`.
 
-    `None` where the mechanism does not report such pages, or where the usage was not read.
+    `None` where the mechanism does not report such pages, or where the usage of that level was not read.
     """
 
     limit_level: str | None
@@ -229,14 +233,14 @@ class RawMemory:
     """
 
     usage_unreadable_file: str | None
-    """The closest usage that cannot be read at a level holding a limit, and why, or `None`.
+    """The closest usage that cannot be read at a level whose limit counts, and why. `None` when every such usage
+    answered.
 
-    Spelled as `unreadable_file` is. Only ever set alongside a `used` of `None`, where it tells the two empty
-    pairs apart. Set, a read failed and may succeed on the next call. `None`, the limit is of a kind this
-    mechanism pairs no usage with at all.
+    Spelled as `unreadable_file` is. A usage file that is not there is named as absent. That level keeps its
+    limit. It is charged the largest charge read below it, or zero where none was. Only ever set beside a filled
+    `used`.
 
-    Beside a `used` that was filled it is `None` as well, and means nothing there: no read failed, so there is
-    nothing to name.
+    A limit that reaches the memory ceiling restricts nothing. It counts only where its level set `available`.
     """
 
     unlocated_file: str | None

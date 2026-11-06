@@ -99,7 +99,7 @@ while True:
 
 The load is measured where the limit binds, which may be the slice above this process. An idle service inside a saturated slice therefore reports the slice's load, because that is what predicts its throttling. `describe().cpu_rate_level` names the level.
 
-For a single measurement rather than a series, `get_cpu_used_ratio(interval)` waits out the window itself and `get_cpu_used_ratio_async(interval)` is its asyncio form. Both raise `ValueError` for an interval below 0.01 seconds - a window that short reports noise rather than a load. Nothing else raises: every reading answers `None` where it cannot be read.
+For a single measurement rather than a series, `get_cpu_used_ratio(interval)` waits out the window itself and `get_cpu_used_ratio_async(interval)` is its asyncio form. Both raise `ValueError` for an interval below 0.01 seconds - a window that short reports noise rather than a load. Nothing else raises: a limit that cannot be read is left out, a memory usage that cannot be read is bounded from below, and a reading with nothing left to read answers `None`.
 
 Log what applies when a service starts, so a surprising number can be explained later:
 
@@ -148,11 +148,13 @@ Do not divide `get_cpu_usage()` by `get_cpu_limit()`. The counter is read at the
 
 `available` is the number to size a budget from, and it is read from the mechanism rather than worked out from the other two: the kernel acts on a distance, not on a ratio. On Linux it is the smallest distance to any limit on the chain, and `used` is whatever keeps that distance exact against the tightest of them - so it need not match the content of any file. On Windows it is what the job may still commit, which is the distance to the job's own limit. `used_ratio` follows from the pair, and is the approximate one.
 
+A usage that cannot be read does not drop the budget. The level holding it keeps its limit, and counts the largest charge read below it, or zero where none was. `used` is then a lower bound, and `available` an upper bound. A `MEMORY_USAGE_UNREADABLE` notice names the file and the reason, or on Windows the job query and its error code.
+
 On Linux the distance counts as free the inactive file cache that is not waiting to reach the disk. The kernel has to reclaim that cache to make room. So the number sizes a budget and does not promise the next allocation. Right after writing it reads lower. It stays lower until the data reaches the disk. On default kernel settings that can be more than half a minute after the writing stopped.
 
 It answers for the limit, not for the machine. A host that is itself running out of memory can refuse an allocation that every number here says there is room for. A cgroup limit does not see the host swapping, and a job's commit headroom does not fall when the machine's does.
 
-The level those numbers describe may be above this process - the pod, or the slice. `describe().memory_limit_level` names it. Everything under that level is charged there, so `used_ratio` is the share of the level rather than of this process. `available` still answers for this process: the room left at that level is the room left here.
+The level those numbers describe may be above this process - the pod, or the slice. `describe().memory_limit_level` names it. Everything under that level is charged there, so `used_ratio` is the share of the level rather than of this process. `available` still answers for this process: the room left at that level is the room left here, as far as it can be read.
 
 `used` is counted differently on the two mechanisms. On Linux it leaves out the inactive file cache, less the pages waiting to be written to disk. It equals the working set that `docker stats` and `kubectl top` report while no pages wait. While pages wait, it reads above that working set on kernels that report them. Waiting pages on the active list come off the credit too, so it can read high. Those tools read one cgroup and never walk up, so they agree with this only while a single level holds a limit. On Windows it is the commit charge of the job, the "Commit size" column rather than the "Working set" one: a process that has committed a gigabyte and touched a tenth of it is charged the gigabyte, because that is what the limit counts.
 
@@ -191,7 +193,7 @@ A limit of `None` with no notice about it means nothing went wrong: the mechanis
 | `CPU_QUOTA_COVERS_MACHINE` | the quota allows the cores of the machine or more | `--cpus=8` on an 8-core host |
 | `CPU_SET_COVERS_MACHINE` | the allowed set covers every core of the machine | a container with no `--cpuset-cpus`, whose effective set lists every core of the host; or a job whose affinity mask lists them all |
 | `MEMORY_USAGE_UNAVAILABLE` | a limit was found, and the mechanism pairs no usage figure with a limit of that kind | a Windows job's per-process memory limit, charged per process while the job counts them together |
-| `MEMORY_USAGE_UNREADABLE` | a limit was found, and the level carrying the usage to pair with it did not answer | an ancestor that holds a limit and no readable `memory.current` |
+| `MEMORY_USAGE_UNREADABLE` | a level holding a limit has a usage that cannot be read, so `used` is a lower bound and `available` an upper bound | an ancestor that holds a limit and no readable `memory.current` |
 | `MACHINE_MEMORY_UNKNOWN` | the size a limit is judged against cannot be read, so a limit cannot be told apart from a sentinel | a sandbox that masks `/proc/meminfo` but leaves `/sys/fs/cgroup` in place |
 | `MACHINE_CPU_COUNT_UNKNOWN` | the cores of the machine cannot be read, and a limit stated as a share of it cannot be turned into cores | a Windows job carrying a CPU rate, where the system will not say how many cores it has |
 | `CPU_USAGE_SCOPE_MISMATCH` | the level the CPU limit applies to counts no CPU time, so no rate can be measured | cgroup v1 with `cpu` and `cpuacct` on separate mounts, where the level holding the quota has no counterpart under the accounting one |

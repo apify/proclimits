@@ -205,23 +205,36 @@ def test_read_memory_derives_the_usage_from_the_commit(monkeypatch: pytest.Monke
     raw = _windows.read_memory()
 
     assert (raw.limit, raw.used, raw.available) == (512 * MIB, 12 * MIB, 500 * MIB)
+    # The commit answered for the usage, so the failed query is not named.
+    assert raw.usage_unreadable_file is None
 
 
 def test_read_memory_without_a_usage_figure(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keeps the limit and drops the pair where neither call answers with a figure to pair it with."""
+    """Charges the job nothing where neither call answers, and names the query and the code."""
     monkeypatch.setattr(
         _windows,
         '_query',
         answering(_JOB_EXTENDED_LIMIT=extended_limits(flags=LIMIT_JOB_MEMORY, memory=512 * MIB)),
     )
-    monkeypatch.setattr(_windows, '_job_memory_in_use', lambda: (None, QUERY_FAILED))
     monkeypatch.setattr(_windows, '_available_commit', lambda: None)
 
     raw = _windows.read_memory()
 
-    assert (raw.limit, raw.used, raw.available) == (512 * MIB, None, None)
+    # A job is one level with nothing below it, so zero is the only bound there is.
+    assert (raw.limit, raw.used, raw.available) == (512 * MIB, 0, 512 * MIB)
     # Two calls failed, so this is a fault to look into rather than the shape of the job.
     assert raw.usage_unreadable_file == f'JobObjectLimitViolationInformation (error {QUERY_FAILED})'
+
+
+def test_job_memory_in_use_reads_the_violation_class(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reads the charge of the job from the limit violation class, which answers with no violation having happened."""
+    violation = _windows._LimitViolation()
+    violation.JobMemory = 12 * MIB
+    # The limit sits beside the charge, so reading the wrong field shows.
+    violation.JobMemoryLimit = 512 * MIB
+    monkeypatch.setattr(_windows, '_query', answering(_JOB_LIMIT_VIOLATION=violation))
+
+    assert _windows._job_memory_in_use() == (12 * MIB, 0)
 
 
 def test_read_memory_with_only_a_per_process_limit(monkeypatch: pytest.MonkeyPatch) -> None:

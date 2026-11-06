@@ -15,7 +15,7 @@ _SHORTEST_WINDOW_SECONDS = 0.01
 class MemoryBudget:
     """A memory limit that actually restricts this process, with the usage charged against it.
 
-    `available` is what this is for: the distance to the limit, and the number to size a budget from.
+    `available` is what this is for: the room left under the limit, and the number to size a budget from.
 
     The limit can belong to a level above this process - a slice, a pod, an enclosing job. Everything under
     that level is charged against it. `used` and `used_ratio` then answer for that level, not for this process.
@@ -39,6 +39,8 @@ class MemoryBudget:
 
     Where several cgroup levels hold a limit it is derived, so it matches no single file.
     `describe().raw_memory_used` says how. Size from `available`.
+
+    Where a usage cannot be read, this is a lower bound, and a `MEMORY_USAGE_UNREADABLE` notice says so.
     """
 
     available: int
@@ -48,8 +50,8 @@ class MemoryBudget:
     the kernel can drop as free. It falls while a process writes, until the data reaches the disk.
     `describe().raw_memory_unflushed_cache` shows how much is waiting.
 
-    Read from the mechanism, never more than the distance to the limit.
-    `describe().raw_memory_available` keeps the number that was read.
+    Read from the mechanism, never more than `limit - used`. `describe().raw_memory_available` keeps the number
+    that was read. Where a usage cannot be read, this is an upper bound.
 
     It answers for the limit rather than for the machine: a host that is itself out of memory can still refuse
     an allocation this leaves room for.
@@ -145,8 +147,11 @@ class Description:
 
     A cgroup derives it, so it matches no single file: `raw_memory_limit - raw_memory_used` is the smallest
     distance to a limit along the chain, moved onto that limit. Each level counts its charge less the file cache
-    counted as free. A job object reports the memory committed by the job outright. `None` where any level
-    holding a limit did not answer with a usage, or where the mechanism pairs none with a limit of that kind.
+    counted as free. A job object reports the memory committed by the job outright. `None` where the mechanism
+    pairs no usage with a limit of that kind.
+
+    A level whose usage cannot be read counts the largest charge read below it, or zero where none was. This is
+    then a lower bound. Beside a reported budget, a `MEMORY_USAGE_UNREADABLE` notice says so.
     """
 
     raw_memory_available: int | None
@@ -162,7 +167,7 @@ class Description:
     Read from `file_dirty` and `file_writeback` under cgroup v2, `total_dirty` and `total_writeback` under
     cgroup v1. The writeback count includes anonymous pages on their way to swap. These pages come off the file
     cache counted as free, down to zero, so they are not the exact amount added to `raw_memory_used`. `None`
-    where the kernel does not report them, where the usage was not read, and under a Windows job.
+    where the kernel does not report them, where the usage of that level was not read, and under a Windows job.
     """
 
     raw_cpu_quota: float | None
@@ -220,9 +225,10 @@ def get_memory_budget(*, throttle_limits: bool = False) -> MemoryBudget | None:
 
     A limit that reaches the ceiling the mechanism judges it against is not reported. That is how an
     unrestricted group spells "no limit". A limit is also not reported when that ceiling cannot be read, or
-    when no usage metric can be paired with it. A limit that cannot be read is left out, and the budget comes
-    from the limits that can be read. `describe()` explains every rejection, names the closest limit left out,
-    and carries the ceiling as `memory_limit_ceiling`.
+    when the mechanism pairs no usage with a limit of that kind. A limit that cannot be read is left out. A
+    usage that cannot be read is bounded from below. The budget comes from what can be read. `describe()`
+    explains every rejection, names the closest limit left out, and carries the ceiling as
+    `memory_limit_ceiling`. Beside a reported budget it also names the closest usage that cannot be read.
 
     Args:
         throttle_limits: Whether to count `memory.high` as a limit beside `memory.max` under cgroup v2. The
@@ -583,7 +589,7 @@ class _CpuEvaluation:
 
 def _evaluate_memory(ceiling: int | None, *, throttle_limits: bool) -> _MemoryEvaluation:
     """Judge the raw memory reading against the size at which a limit stops restricting."""
-    raw = _backend.read_memory(throttle_limits=throttle_limits)
+    raw = _backend.read_memory(throttle_limits=throttle_limits, ceiling=ceiling)
     notices = []
 
     if raw.unreadable_file is not None:
@@ -602,6 +608,16 @@ def _evaluate_memory(ceiling: int | None, *, throttle_limits: bool) -> _MemoryEv
         # Nothing to report: no level holds a limit that counts and can be read. A limit left out is named above.
         # The last two tests never decide this branch, and stay only to narrow the type below.
         return _MemoryEvaluation(effective=None, raw=raw, notices=tuple(notices))
+
+    # Only beside a budget that is reported. A budget dropped for another reason has no bounds to qualify.
+    if raw.usage_unreadable_file is not None:
+        notices.append(
+            Notice(
+                code=NoticeCode.MEMORY_USAGE_UNREADABLE,
+                message=f'The memory usage in {raw.usage_unreadable_file} cannot be read. The used memory reported '
+                'is a lower bound, and the available memory an upper bound.',
+            )
+        )
 
     return _MemoryEvaluation(effective=_reconcile(raw.limit, raw.used, raw.available), raw=raw, notices=tuple(notices))
 
@@ -638,25 +654,15 @@ def _memory_rejection(raw: RawMemory, ceiling: int | None) -> Notice | None:
         )
 
     if raw.used is None or raw.available is None:
-        return _unpaired_limit_notice(raw.limit, raw.usage_unreadable_file)
-
-    return None
-
-
-def _unpaired_limit_notice(limit: int, usage_unreadable_file: str | None) -> Notice:
-    """Say why a limit was found with no usage to pair against it, which happens two ways."""
-    if usage_unreadable_file is not None:
+        # A usage that cannot be read is bounded rather than missing, so only a limit of a kind the mechanism
+        # pairs no usage with gets here.
         return Notice(
-            code=NoticeCode.MEMORY_USAGE_UNREADABLE,
-            message=f'Found a memory limit of {limit} bytes, and the memory usage in {usage_unreadable_file} '
-            'cannot be read, so the limit is not reported.',
+            code=NoticeCode.MEMORY_USAGE_UNAVAILABLE,
+            message=f'Found a memory limit of {raw.limit} bytes that this mechanism pairs no usage metric with, so '
+            'the limit is not reported.',
         )
 
-    return Notice(
-        code=NoticeCode.MEMORY_USAGE_UNAVAILABLE,
-        message=f'Found a memory limit of {limit} bytes that this mechanism pairs no usage metric with, so '
-        'the limit is not reported.',
-    )
+    return None
 
 
 def _evaluate_cpu_limit(machine_cpus: int | None) -> _CpuEvaluation:
