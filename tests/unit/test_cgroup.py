@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import errno
 import os
+import sys
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -19,11 +20,18 @@ from .conftest import (
     V1_SELF_CGROUP,
     V2_MOUNTINFO,
     V2_SELF_CGROUP,
+    emfile,
     fail_to_read,
 )
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+OPENING_A_DIRECTORY = 'EACCES' if sys.platform == 'win32' else 'EISDIR'
+"""The errno a directory put in place of a control file fails to open with, which differs by platform."""
+
+UNNAMED_ERRNO = 99999
+"""An errno that no platform gives a name."""
 
 MEMORY_FILES = {'memory.max': '1000\n', 'memory.current': '100\n', 'memory.stat': 'inactive_file 0\n'}
 """A memory limit at the top of the mount, so a lookup that succeeds locates the memory controller."""
@@ -184,8 +192,8 @@ def test_read_hierarchies_no_unified_when_no_mount_covers(fake_cgroup: Callable[
         available=None,
         unflushed_cache=None,
         limit_level=None,
-        unreadable_level=None,
-        usage_unreadable_level=None,
+        unreadable_file=None,
+        usage_unreadable_file=None,
         unlocated_file=None,
     )
 
@@ -212,8 +220,8 @@ def test_read_hierarchies_v1_answers_when_no_cgroup2_mount_covers(fake_cgroup: C
         available=536870312,
         unflushed_cache=None,
         limit_level=str(root / 'memory'),
-        unreadable_level=None,
-        usage_unreadable_level=None,
+        unreadable_file=None,
+        usage_unreadable_file=None,
         unlocated_file=None,
     )
 
@@ -349,7 +357,7 @@ def test_locate_controllers_keeps_an_absent_proc(
 ) -> None:
     """Keeps a `/proc` that is not there, which lasts as long as the process, and names no file."""
     fake_cgroup(mountinfo=V2_MOUNTINFO, self_cgroup=V2_SELF_CGROUP.format(path='/'), files=MEMORY_FILES)
-    fail_to_read(monkeypatch, cgroup._PROC_SELF_CGROUP, error, times=3)
+    fail_to_read(monkeypatch, cgroup._PROC_SELF_CGROUP, error, times=None)
     discoveries = count_discoveries(monkeypatch)
 
     located_nothing = cgroup.Controllers(
@@ -363,8 +371,7 @@ def test_locate_controllers_keeps_an_absent_proc(
 def test_locate_controllers_keeps_an_absent_proc_out_of_descriptors(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keeps a `/proc` file that is not there where opening it fails for want of file descriptors."""
     # Out of descriptors, opening a file that is not there fails with EMFILE rather than ENOENT.
-    emfile = OSError(errno.EMFILE, os.strerror(errno.EMFILE))
-    fail_to_read(monkeypatch, cgroup._PROC_SELF_CGROUP, emfile, times=3)
+    fail_to_read(monkeypatch, cgroup._PROC_SELF_CGROUP, emfile(), times=None)
     discoveries = count_discoveries(monkeypatch)
 
     located_nothing = cgroup.Controllers(
@@ -389,7 +396,7 @@ def test_locate_controllers_retries_where_a_stat_cannot_tell_absence(monkeypatch
 
     # A refused stat says nothing about whether the file is there. Taken for absence, it would be kept.
     with monkeypatch.context() as patch:
-        fail_to_read(patch, path, OSError(errno.EMFILE, os.strerror(errno.EMFILE)), times=1)
+        fail_to_read(patch, path, emfile(), times=1)
         patch.setattr(Path, 'stat', refuse_stat)
         failed = cgroup.locate_controllers()
 
@@ -441,7 +448,7 @@ def test_read_memory_names_a_failed_lookup(
     """Names the `/proc` file its own lookup could not read, and names none once a lookup succeeds."""
     root = fake_cgroup(mountinfo=V2_MOUNTINFO, self_cgroup=V2_SELF_CGROUP.format(path='/'), files=MEMORY_FILES)
     path = cgroup._PROC_SELF_CGROUP
-    fail_to_read(monkeypatch, path, OSError(errno.EMFILE, os.strerror(errno.EMFILE)), times=1)
+    fail_to_read(monkeypatch, path, emfile(), times=1)
 
     assert cgroup.read_memory() == cgroup.RawMemory(
         limit=None,
@@ -449,8 +456,8 @@ def test_read_memory_names_a_failed_lookup(
         available=None,
         unflushed_cache=None,
         limit_level=None,
-        unreadable_level=None,
-        usage_unreadable_level=None,
+        unreadable_file=None,
+        usage_unreadable_file=None,
         unlocated_file=f'{path} (EMFILE)',
     )
     assert cgroup.read_memory() == cgroup.RawMemory(
@@ -459,8 +466,8 @@ def test_read_memory_names_a_failed_lookup(
         available=900,
         unflushed_cache=None,
         limit_level=str(root),
-        unreadable_level=None,
-        usage_unreadable_level=None,
+        unreadable_file=None,
+        usage_unreadable_file=None,
         unlocated_file=None,
     )
 
@@ -476,15 +483,15 @@ def test_read_cpu_names_a_failed_lookup(
         files={'cpu.max': '200000 100000\n', 'cpu.stat': 'usage_usec 0\n'},
     )
     path = cgroup._PROC_SELF_CGROUP
-    fail_to_read(monkeypatch, path, OSError(errno.EMFILE, os.strerror(errno.EMFILE)), times=1)
+    fail_to_read(monkeypatch, path, emfile(), times=1)
 
     assert cgroup.read_cpu() == cgroup.RawCpu(
-        quota=None, cpu_set=None, unreadable_level=None, unconvertible_level=None, unlocated_file=f'{path} (EMFILE)'
+        quota=None, cpu_set=None, unreadable_file=None, unconvertible_level=None, unlocated_file=f'{path} (EMFILE)'
     )
     assert cgroup.read_cpu() == cgroup.RawCpu(
         quota=cgroup.RawCpuQuota(cores=2.0, limit_level=str(root), usage_level=str(root)),
         cpu_set=None,
-        unreadable_level=None,
+        unreadable_file=None,
         unconvertible_level=None,
         unlocated_file=None,
     )
@@ -698,12 +705,13 @@ def test_read_memory_does_not_open_memory_high_by_default(fake_cgroup: Callable[
         available=900,
         unflushed_cache=None,
         limit_level=str(root),
-        unreadable_level=None,
-        usage_unreadable_level=None,
+        unreadable_file=None,
+        usage_unreadable_file=None,
         unlocated_file=None,
     )
     # The same file voids the reading once it is asked for.
-    assert cgroup.read_memory(throttle_limits=True).unreadable_level == str(root)
+    expected = f'{root / "memory.high"} ({OPENING_A_DIRECTORY})'
+    assert cgroup.read_memory(throttle_limits=True).unreadable_file == expected
 
 
 def test_read_memory_tightest_level(fake_cgroup: Callable[..., Path]) -> None:
@@ -730,8 +738,8 @@ def test_read_memory_tightest_level(fake_cgroup: Callable[..., Path]) -> None:
         available=900,
         unflushed_cache=None,
         limit_level=str(root / 'kubepods' / 'pod' / 'container'),
-        unreadable_level=None,
-        usage_unreadable_level=None,
+        unreadable_file=None,
+        usage_unreadable_file=None,
         unlocated_file=None,
     )
 
@@ -762,8 +770,8 @@ def test_read_memory_when_the_tightest_limit_is_not_the_closest(fake_cgroup: Cal
         available=50,
         unflushed_cache=None,
         limit_level=str(root / 'pod' / 'container'),
-        unreadable_level=None,
-        usage_unreadable_level=None,
+        unreadable_file=None,
+        usage_unreadable_file=None,
         unlocated_file=None,
     )
 
@@ -792,8 +800,8 @@ def test_read_memory_tighter_ancestor(fake_cgroup: Callable[..., Path]) -> None:
         available=50,
         unflushed_cache=None,
         limit_level=str(root / 'kubepods'),
-        unreadable_level=None,
-        usage_unreadable_level=None,
+        unreadable_file=None,
+        usage_unreadable_file=None,
         unlocated_file=None,
     )
 
@@ -822,8 +830,8 @@ def test_read_memory_smallest_distance(fake_cgroup: Callable[..., Path]) -> None
         available=20,
         unflushed_cache=None,
         limit_level=str(root / 'kubepods' / 'pod'),
-        unreadable_level=None,
-        usage_unreadable_level=None,
+        unreadable_file=None,
+        usage_unreadable_file=None,
         unlocated_file=None,
     )
 
@@ -850,8 +858,8 @@ def test_read_memory_partial_level(fake_cgroup: Callable[..., Path]) -> None:
         available=None,
         unflushed_cache=None,
         limit_level=str(root / 'kubepods' / 'pod' / 'container'),
-        unreadable_level=None,
-        usage_unreadable_level=str(root / 'kubepods' / 'pod' / 'container'),
+        unreadable_file=None,
+        usage_unreadable_file=f'{root / "kubepods" / "pod" / "container" / "memory.stat"} (has no inactive_file)',
         unlocated_file=None,
     )
 
@@ -907,8 +915,8 @@ def test_read_memory_usage_above_the_limit(fake_cgroup: Callable[..., Path]) -> 
         available=0,
         unflushed_cache=None,
         limit_level=str(root),
-        unreadable_level=None,
-        usage_unreadable_level=None,
+        unreadable_file=None,
+        usage_unreadable_file=None,
         unlocated_file=None,
     )
 
@@ -938,8 +946,8 @@ def test_read_memory_ancestor_without_usage_files(fake_cgroup: Callable[..., Pat
         available=None,
         unflushed_cache=None,
         limit_level=str(root / 'pod'),
-        unreadable_level=None,
-        usage_unreadable_level=str(root / 'pod'),
+        unreadable_file=None,
+        usage_unreadable_file=f'{root / "pod" / "memory.current"} ({OPENING_A_DIRECTORY})',
         unlocated_file=None,
     )
 
@@ -958,8 +966,8 @@ def test_read_memory_no_used(fake_cgroup: Callable[..., Path]) -> None:
         available=None,
         unflushed_cache=None,
         limit_level=str(root),
-        unreadable_level=None,
-        usage_unreadable_level=str(root),
+        unreadable_file=None,
+        usage_unreadable_file=f'{root / "memory.stat"} (has no inactive_file)',
         unlocated_file=None,
     )
 
@@ -984,8 +992,8 @@ def test_read_memory_missing_files(fake_cgroup: Callable[..., Path]) -> None:
         available=268434856,
         unflushed_cache=None,
         limit_level=str(root / 'pod'),
-        unreadable_level=None,
-        usage_unreadable_level=None,
+        unreadable_file=None,
+        usage_unreadable_file=None,
         unlocated_file=None,
     )
 
@@ -1121,14 +1129,14 @@ def test_read_cpu_set_size(
 
 
 def test_read_cpu_set_size_unparsable_entry(fake_cgroup: Callable[..., Path]) -> None:
-    """Names the level when one entry of the list does not parse, rather than counting the rest."""
+    """Names the file when one entry of the list does not parse, rather than counting the rest."""
     root = fake_cgroup(
         mountinfo=V2_MOUNTINFO,
         self_cgroup=V2_SELF_CGROUP.format(path='/'),
         files={'cpuset.cpus.effective': '0-1,nonsense\n'},
     )
 
-    assert cgroup.read_cpu().unreadable_level == str(root)
+    assert cgroup.read_cpu().unreadable_file == f'{root / "cpuset.cpus.effective"} (holds no list of cores)'
 
 
 @pytest.mark.parametrize(
@@ -1180,7 +1188,7 @@ def test_read_cpu_set_size_file_disappears(fake_cgroup: Callable[..., Path]) -> 
 
 
 def test_read_cpu_set_size_unreadable_file(fake_cgroup: Callable[..., Path]) -> None:
-    """Names the level whose set cannot be read, instead of reporting no restriction."""
+    """Names the set file that cannot be read, with the errno, instead of reporting no restriction."""
     root = fake_cgroup(
         mountinfo=V2_MOUNTINFO,
         self_cgroup=V2_SELF_CGROUP.format(path='/'),
@@ -1191,7 +1199,11 @@ def test_read_cpu_set_size_unreadable_file(fake_cgroup: Callable[..., Path]) -> 
     (root / 'cpuset.cpus.effective').mkdir()
 
     assert cgroup.read_cpu() == cgroup.RawCpu(
-        quota=None, cpu_set=None, unreadable_level=str(root), unconvertible_level=None, unlocated_file=None
+        quota=None,
+        cpu_set=None,
+        unreadable_file=f'{root / "cpuset.cpus.effective"} ({OPENING_A_DIRECTORY})',
+        unconvertible_level=None,
+        unlocated_file=None,
     )
 
 
@@ -1294,7 +1306,7 @@ def test_read_memory_unreadable_limit(
     readable: str,
     options: dict[str, bool],
 ) -> None:
-    """Names the level whose limit cannot be read, instead of answering with a limit that may be looser."""
+    """Names the file whose limit cannot be read, and why, instead of answering with a limit that may be looser."""
     root = fake_cgroup(
         mountinfo=V2_MOUNTINFO,
         self_cgroup=V2_SELF_CGROUP.format(path='/pod/container'),
@@ -1315,8 +1327,8 @@ def test_read_memory_unreadable_limit(
         available=None,
         unflushed_cache=None,
         limit_level=None,
-        unreadable_level=str(root / 'pod' / 'container'),
-        usage_unreadable_level=None,
+        unreadable_file=f'{root / "pod" / "container" / unreadable} (holds no number)',
+        usage_unreadable_file=None,
         unlocated_file=None,
     )
 
@@ -1344,14 +1356,14 @@ def test_read_memory_looser_level_without_usage(fake_cgroup: Callable[..., Path]
         available=None,
         unflushed_cache=None,
         limit_level=str(root / 'pod' / 'container'),
-        unreadable_level=None,
-        usage_unreadable_level=str(root / 'pod'),
+        unreadable_file=None,
+        usage_unreadable_file=f'{root / "pod" / "memory.current"} ({OPENING_A_DIRECTORY})',
         unlocated_file=None,
     )
 
 
 def test_read_memory_limit_file_cannot_be_opened(fake_cgroup: Callable[..., Path]) -> None:
-    """Names a level whose limit file is there but cannot be read at all, as for one that holds nonsense."""
+    """Names a limit file that is there and cannot be opened, with the errno, as for one that holds nonsense."""
     root = fake_cgroup(
         mountinfo=V2_MOUNTINFO,
         self_cgroup=V2_SELF_CGROUP.format(path='/pod/container'),
@@ -1365,7 +1377,8 @@ def test_read_memory_limit_file_cannot_be_opened(fake_cgroup: Callable[..., Path
     # A directory in place of the file, so the file is there and the read fails.
     (root / 'pod' / 'container' / 'memory.max').mkdir()
 
-    assert cgroup.read_memory().unreadable_level == str(root / 'pod' / 'container')
+    expected = f'{root / "pod" / "container" / "memory.max"} ({OPENING_A_DIRECTORY})'
+    assert cgroup.read_memory().unreadable_file == expected
 
 
 @pytest.mark.parametrize(
@@ -1382,7 +1395,7 @@ def test_read_memory_negative_limit(
     readable: str,
     options: dict[str, bool],
 ) -> None:
-    """Names a level whose limit is a negative number of bytes, which is no limit and no absence either."""
+    """Names a limit file holding a negative number of bytes, which is no limit and no absence either."""
     root = fake_cgroup(
         mountinfo=V2_MOUNTINFO,
         self_cgroup=V2_SELF_CGROUP.format(path='/pod/container'),
@@ -1395,11 +1408,12 @@ def test_read_memory_negative_limit(
         },
     )
 
-    assert cgroup.read_memory(**options).unreadable_level == str(root / 'pod' / 'container')
+    expected = f'{root / "pod" / "container" / negative} (holds a negative number)'
+    assert cgroup.read_memory(**options).unreadable_file == expected
 
 
-def test_read_cpu_quota_unreadable_level(fake_cgroup: Callable[..., Path]) -> None:
-    """Names the level whose quota cannot be read, instead of answering with a looser ancestor."""
+def test_read_cpu_quota_unreadable_file(fake_cgroup: Callable[..., Path]) -> None:
+    """Names the quota file that cannot be read, and why, instead of answering with a looser ancestor."""
     root = fake_cgroup(
         mountinfo=V2_MOUNTINFO,
         self_cgroup=V2_SELF_CGROUP.format(path='/pod/container'),
@@ -1414,10 +1428,27 @@ def test_read_cpu_quota_unreadable_level(fake_cgroup: Callable[..., Path]) -> No
     assert cgroup.read_cpu() == cgroup.RawCpu(
         quota=None,
         cpu_set=None,
-        unreadable_level=str(root / 'pod' / 'container'),
+        unreadable_file=f'{root / "pod" / "container" / "cpu.max"} (holds no quota and period)',
         unconvertible_level=None,
         unlocated_file=None,
     )
+
+
+def record_reads(monkeypatch: pytest.MonkeyPatch, *names: str) -> list[Path]:
+    """Record the path each named reader of `cgroup` is called with, in order, and read as usual."""
+    read: list[Path] = []
+
+    def recording(reader: Callable[..., Any]) -> Callable[..., Any]:
+        def record(path: Path, *args: Any, **kwargs: Any) -> Any:
+            read.append(path)
+            return reader(path, *args, **kwargs)
+
+        return record
+
+    for name in names:
+        monkeypatch.setattr(cgroup, name, recording(getattr(cgroup, name)))
+
+    return read
 
 
 def test_read_cpu_set_size_inherited_under_v1(fake_cgroup: Callable[..., Path]) -> None:
@@ -1531,8 +1562,8 @@ def test_locate_controllers_hybrid(fake_cgroup: Callable[..., Path]) -> None:
         available=536870312,
         unflushed_cache=None,
         limit_level=str(root / 'memory'),
-        unreadable_level=None,
-        usage_unreadable_level=None,
+        unreadable_file=None,
+        usage_unreadable_file=None,
         unlocated_file=None,
     )
 
@@ -1546,13 +1577,13 @@ def test_no_cgroups() -> None:
         available=None,
         unflushed_cache=None,
         limit_level=None,
-        unreadable_level=None,
-        usage_unreadable_level=None,
+        unreadable_file=None,
+        usage_unreadable_file=None,
         unlocated_file=None,
     )
     # An absent `/proc` is a fact about the system rather than a failed lookup, so no file is named.
     assert cgroup.read_cpu() == cgroup.RawCpu(
-        quota=None, cpu_set=None, unreadable_level=None, unconvertible_level=None, unlocated_file=None
+        quota=None, cpu_set=None, unreadable_file=None, unconvertible_level=None, unlocated_file=None
     )
     assert cgroup.read_cpu_quota(cgroup.locate_controllers()) is None
     assert cgroup.read_cpu_set_size(cgroup.locate_controllers()) is None
@@ -1590,8 +1621,8 @@ def test_locate_controllers_with_unreadable_directories(
         available=None,
         unflushed_cache=None,
         limit_level=None,
-        unreadable_level=None,
-        usage_unreadable_level=None,
+        unreadable_file=None,
+        usage_unreadable_file=None,
         unlocated_file=None,
     )
 
@@ -1736,8 +1767,8 @@ def test_read_memory_limit_of_zero(fake_cgroup: Callable[..., Path]) -> None:
         available=0,
         unflushed_cache=None,
         limit_level=str(root / 'pod' / 'container'),
-        unreadable_level=None,
-        usage_unreadable_level=None,
+        unreadable_file=None,
+        usage_unreadable_file=None,
         unlocated_file=None,
     )
 
@@ -1763,14 +1794,14 @@ def test_read_memory_usage_below_the_cache(fake_cgroup: Callable[..., Path]) -> 
         available=1000,
         unflushed_cache=None,
         limit_level=str(root),
-        unreadable_level=None,
-        usage_unreadable_level=None,
+        unreadable_file=None,
+        usage_unreadable_file=None,
         unlocated_file=None,
     )
 
 
 def test_read_cpu_quota_v1_zero_period(fake_cgroup: Callable[..., Path]) -> None:
-    """Names the level rather than dividing by a period of zero, which no kernel writes."""
+    """Names the period file rather than dividing by a period of zero, which no kernel writes."""
     root = fake_cgroup(
         mountinfo=V1_MOUNTINFO,
         self_cgroup=V1_SELF_CGROUP.format(path='/'),
@@ -1781,7 +1812,23 @@ def test_read_cpu_quota_v1_zero_period(fake_cgroup: Callable[..., Path]) -> None
         },
     )
 
-    assert cgroup.read_cpu().unreadable_level == str(root / 'cpu,cpuacct')
+    expected = f'{root / "cpu,cpuacct" / "cpu.cfs_period_us"} (holds zero or less)'
+    assert cgroup.read_cpu().unreadable_file == expected
+
+
+def test_read_cpu_quota_v1_zero_quota(fake_cgroup: Callable[..., Path]) -> None:
+    """Names the quota file for a quota of zero, which no kernel writes."""
+    root = fake_cgroup(
+        mountinfo=V1_MOUNTINFO,
+        self_cgroup=V1_SELF_CGROUP.format(path='/'),
+        files={
+            'cpu,cpuacct/cpu.cfs_quota_us': '0\n',
+            'cpu,cpuacct/cpu.cfs_period_us': '100000\n',
+            'cpu,cpuacct/cpuacct.usage': '0\n',
+        },
+    )
+
+    assert cgroup.read_cpu().unreadable_file == f'{root / "cpu,cpuacct" / "cpu.cfs_quota_us"} (holds zero)'
 
 
 def test_read_hierarchies_first_v1_mount_wins(fake_cgroup: Callable[..., Path]) -> None:
@@ -1829,8 +1876,8 @@ def test_read_hierarchies_skips_a_foreign_v1_mount(fake_cgroup: Callable[..., Pa
         available=1900,
         unflushed_cache=None,
         limit_level=str(root / 'ours' / 'mine'),
-        unreadable_level=None,
-        usage_unreadable_level=None,
+        unreadable_file=None,
+        usage_unreadable_file=None,
         unlocated_file=None,
     )
 
@@ -1853,8 +1900,8 @@ def test_read_memory_v1_uses_the_hierarchical_key(fake_cgroup: Callable[..., Pat
         available=500,
         unflushed_cache=None,
         limit_level=str(root / 'memory'),
-        unreadable_level=None,
-        usage_unreadable_level=None,
+        unreadable_file=None,
+        usage_unreadable_file=None,
         unlocated_file=None,
     )
 
@@ -1913,14 +1960,14 @@ def test_read_cpu_quota_without_accounting(fake_cgroup: Callable[..., Path]) -> 
     ],
 )
 def test_read_cpu_quota_v2_degenerate(fake_cgroup: Callable[..., Path], cpu_max: str) -> None:
-    """Names the level for a cgroup v2 quota that is not bandwidth, since this interface spells absence as `max`."""
+    """Names the file for a cgroup v2 quota that is not bandwidth, since this interface spells absence as `max`."""
     root = fake_cgroup(
         mountinfo=V2_MOUNTINFO,
         self_cgroup=V2_SELF_CGROUP.format(path='/'),
         files={'cpu.max': cpu_max, 'cpu.stat': 'usage_usec 0\n'},
     )
 
-    assert cgroup.read_cpu().unreadable_level == str(root)
+    assert cgroup.read_cpu().unreadable_file == f'{root / "cpu.max"} (holds a quota or period of zero or less)'
 
 
 def test_read_cpu_quota_appearing_after_discovery(fake_cgroup: Callable[..., Path]) -> None:
@@ -1968,8 +2015,8 @@ def test_read_memory_dirty_cache_is_not_credited(fake_cgroup: Callable[..., Path
         available=400,
         unflushed_cache=300,
         limit_level=str(root),
-        unreadable_level=None,
-        usage_unreadable_level=None,
+        unreadable_file=None,
+        usage_unreadable_file=None,
         unlocated_file=None,
     )
 
@@ -1996,8 +2043,8 @@ def test_read_memory_dirty_cache_is_not_credited_v1(fake_cgroup: Callable[..., P
         available=400,
         unflushed_cache=300,
         limit_level=str(root / 'memory'),
-        unreadable_level=None,
-        usage_unreadable_level=None,
+        unreadable_file=None,
+        usage_unreadable_file=None,
         unlocated_file=None,
     )
 
@@ -2021,8 +2068,8 @@ def test_read_memory_more_waiting_than_inactive_cache(fake_cgroup: Callable[...,
         available=100,
         unflushed_cache=350,
         limit_level=str(root),
-        unreadable_level=None,
-        usage_unreadable_level=None,
+        unreadable_file=None,
+        usage_unreadable_file=None,
         unlocated_file=None,
     )
 
@@ -2052,14 +2099,14 @@ def test_read_memory_without_the_dirty_keys(fake_cgroup: Callable[..., Path]) ->
         available=500,
         unflushed_cache=None,
         limit_level=str(root / 'memory'),
-        unreadable_level=None,
-        usage_unreadable_level=None,
+        unreadable_file=None,
+        usage_unreadable_file=None,
         unlocated_file=None,
     )
 
 
 def test_read_memory_dirty_keys_without_the_inactive_cache(fake_cgroup: Callable[..., Path]) -> None:
-    """Names the level where the inactive cache is missing, whatever else the stat file carries."""
+    """Names the stat file where the inactive cache is missing, whatever else it carries."""
     root = fake_cgroup(
         mountinfo=V2_MOUNTINFO,
         self_cgroup=V2_SELF_CGROUP.format(path='/'),
@@ -2076,8 +2123,8 @@ def test_read_memory_dirty_keys_without_the_inactive_cache(fake_cgroup: Callable
         available=None,
         unflushed_cache=None,
         limit_level=str(root),
-        unreadable_level=None,
-        usage_unreadable_level=str(root),
+        unreadable_file=None,
+        usage_unreadable_file=f'{root / "memory.stat"} (has no inactive_file)',
         unlocated_file=None,
     )
 
@@ -2107,8 +2154,8 @@ def test_read_memory_reports_the_cache_of_the_deciding_level(fake_cgroup: Callab
         available=15,
         unflushed_cache=5,
         limit_level=str(root / 'kubepods' / 'pod'),
-        unreadable_level=None,
-        usage_unreadable_level=None,
+        unreadable_file=None,
+        usage_unreadable_file=None,
         unlocated_file=None,
     )
 
@@ -2139,8 +2186,8 @@ def test_read_memory_reports_the_cache_of_the_closest_level_on_a_tie(fake_cgroup
         available=58,
         unflushed_cache=2,
         limit_level=str(root / 'kubepods' / 'pod'),
-        unreadable_level=None,
-        usage_unreadable_level=None,
+        unreadable_file=None,
+        usage_unreadable_file=None,
         unlocated_file=None,
     )
 
@@ -2163,19 +2210,7 @@ def test_read_memory_reads_the_stat_file_once_per_level(
         },
     )
 
-    read: list[str] = []
-    read_stat_values, read_counter = cgroup._read_stat_values, cgroup._read_counter
-
-    def record_stat_values(path: Path, keys: tuple[str, ...]) -> dict[str, int] | None:
-        read.append(str(path))
-        return read_stat_values(path, keys)
-
-    def record_counter(path: Path) -> int | None:
-        read.append(str(path))
-        return read_counter(path)
-
-    monkeypatch.setattr(cgroup, '_read_stat_values', record_stat_values)
-    monkeypatch.setattr(cgroup, '_read_counter', record_counter)
+    read = record_reads(monkeypatch, '_read_stat_values', '_read_number')
 
     # Only that a reading happened matters here.
     assert cgroup.read_memory().used is not None
@@ -2183,8 +2218,8 @@ def test_read_memory_reads_the_stat_file_once_per_level(
     # Two levels, so this pins one parse per level rather than one parse in total. Whole paths, because both
     # levels name the file `memory.stat`.
     for level in (root / 'pod' / 'container', root / 'pod'):
-        assert read.count(str(level / 'memory.stat')) == 1
-        assert read.index(str(level / 'memory.current')) < read.index(str(level / 'memory.stat'))
+        assert read.count(level / 'memory.stat') == 1
+        assert read.index(level / 'memory.current') < read.index(level / 'memory.stat')
 
 
 def test_read_memory_with_the_dirty_keys_at_zero(fake_cgroup: Callable[..., Path]) -> None:
@@ -2206,8 +2241,8 @@ def test_read_memory_with_the_dirty_keys_at_zero(fake_cgroup: Callable[..., Path
         available=700,
         unflushed_cache=0,
         limit_level=str(root),
-        unreadable_level=None,
-        usage_unreadable_level=None,
+        unreadable_file=None,
+        usage_unreadable_file=None,
         unlocated_file=None,
     )
 
@@ -2231,8 +2266,8 @@ def test_read_memory_unparsable_dirty_key(fake_cgroup: Callable[..., Path]) -> N
         available=600,
         unflushed_cache=100,
         limit_level=str(root),
-        unreadable_level=None,
-        usage_unreadable_level=None,
+        unreadable_file=None,
+        usage_unreadable_file=None,
         unlocated_file=None,
     )
 
@@ -2268,8 +2303,8 @@ def test_read_memory_negative_dirty_key(fake_cgroup: Callable[..., Path]) -> Non
         available=700,
         unflushed_cache=0,
         limit_level=str(root),
-        unreadable_level=None,
-        usage_unreadable_level=None,
+        unreadable_file=None,
+        usage_unreadable_file=None,
         unlocated_file=None,
     )
 
@@ -2293,7 +2328,136 @@ def test_read_memory_negative_key_beside_a_positive_one(fake_cgroup: Callable[..
         available=200,
         unflushed_cache=500,
         limit_level=str(root),
-        unreadable_level=None,
-        usage_unreadable_level=None,
+        unreadable_file=None,
+        usage_unreadable_file=None,
         unlocated_file=None,
     )
+
+
+@pytest.mark.parametrize(
+    ('files', 'name', 'reason'),
+    [
+        pytest.param({'pod/memory.stat': 'inactive_file 0\n'}, 'memory.current', 'absent', id='no usage file'),
+        pytest.param(
+            {'pod/memory.current': 'nonsense\n', 'pod/memory.stat': 'inactive_file 0\n'},
+            'memory.current',
+            'holds no number',
+            id='a usage that is no number',
+        ),
+        pytest.param({'pod/memory.current': '100\n'}, 'memory.stat', 'absent', id='no stat file'),
+    ],
+)
+def test_read_memory_names_why_a_usage_cannot_be_read(
+    fake_cgroup: Callable[..., Path],
+    files: dict[str, str],
+    name: str,
+    reason: str,
+) -> None:
+    """Names the usage file of a level holding a limit, and what kept it from being read."""
+    root = fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/pod'),
+        files={
+            # The controller is found by its usage file, so a level above carries one.
+            'memory.current': '0\n',
+            'pod/memory.max': '1000\n',
+            **files,
+        },
+    )
+
+    assert cgroup.read_memory().usage_unreadable_file == f'{root / "pod" / name} ({reason})'
+
+
+def test_read_memory_names_the_closest_silent_usage(fake_cgroup: Callable[..., Path]) -> None:
+    """Names the usage file of the closest level when two levels holding a limit cannot be read."""
+    root = fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/pod/container'),
+        files={
+            'pod/container/memory.max': '1000\n',
+            'pod/container/memory.stat': 'inactive_file 0\n',
+            'pod/memory.max': '2000\n',
+            'pod/memory.stat': 'inactive_file 0\n',
+        },
+    )
+    (root / 'pod' / 'container' / 'memory.current').mkdir()
+    (root / 'pod' / 'memory.current').mkdir()
+
+    expected = f'{root / "pod" / "container" / "memory.current"} ({OPENING_A_DIRECTORY})'
+    assert cgroup.read_memory().usage_unreadable_file == expected
+
+
+def test_read_cpu_quota_names_the_closest_unreadable_file(fake_cgroup: Callable[..., Path]) -> None:
+    """Names the quota file of the closest level when two levels hold one that cannot be read."""
+    root = fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/pod/container'),
+        files={
+            'pod/container/cpu.max': 'nonsense\n',
+            'pod/container/cpu.stat': 'usage_usec 0\n',
+            'pod/cpu.max': '0 100000\n',
+            'pod/cpu.stat': 'usage_usec 0\n',
+        },
+    )
+
+    expected = f'{root / "pod" / "container" / "cpu.max"} (holds no quota and period)'
+    assert cgroup.read_cpu().unreadable_file == expected
+
+
+@pytest.mark.parametrize(
+    ('error', 'reason'),
+    [
+        pytest.param(errno.EACCES, 'EACCES', id='a file nobody may read'),
+        pytest.param(errno.EMFILE, 'EMFILE', id='a process out of file descriptors'),
+    ],
+)
+def test_read_memory_names_the_errno_a_limit_failed_with(
+    fake_cgroup: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    error: int,
+    reason: str,
+) -> None:
+    """Names the errno a limit file failed with, which tells a descriptor shortage from a permission."""
+    root = fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/'),
+        files={'memory.max': '1000\n', 'memory.current': '100\n', 'memory.stat': 'inactive_file 0\n'},
+    )
+    refused = root / 'memory.max'
+    fail_to_read(monkeypatch, refused, OSError(error, os.strerror(error)), times=None)
+
+    assert cgroup.read_memory().unreadable_file == f'{refused} ({reason})'
+
+
+def test_read_memory_names_the_errno_a_stat_file_failed_with(
+    fake_cgroup: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Names the errno of a stat file that is there and cannot be opened, rather than calling it absent."""
+    root = fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/'),
+        files={'memory.max': '1000\n', 'memory.current': '100\n', 'memory.stat': 'inactive_file 0\n'},
+    )
+    refused = root / 'memory.stat'
+    fail_to_read(monkeypatch, refused, OSError(errno.EACCES, os.strerror(errno.EACCES)), times=None)
+
+    assert cgroup.read_memory().usage_unreadable_file == f'{refused} (EACCES)'
+
+
+@pytest.mark.parametrize(
+    ('error', 'reason'),
+    [
+        pytest.param(OSError(errno.EACCES, 'Permission denied'), 'EACCES', id='an errno with a name'),
+        pytest.param(OSError(UNNAMED_ERRNO, 'Unknown'), str(UNNAMED_ERRNO), id='an errno with no name'),
+        pytest.param(OSError('no errno'), 'OSError', id='an error with no errno'),
+        pytest.param(
+            UnicodeDecodeError('utf-8', b'\x81', 0, 1, 'invalid start byte'),
+            'UnicodeDecodeError',
+            id='content that is not text',
+        ),
+    ],
+)
+def test_failure_reason(error: OSError | ValueError, reason: str) -> None:
+    """Names a failed read by its errno where it has one, and by the kind of error otherwise."""
+    assert cgroup._failure_reason(error) == reason

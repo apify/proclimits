@@ -606,12 +606,8 @@ def _reconcile(limit: int, used: int, available: int) -> MemoryBudget:
 
 def _memory_rejection(raw: RawMemory, ceiling: int | None) -> Notice | None:
     """Say why the raw memory reading cannot be reported. `None` where it can."""
-    if raw.unreadable_level is not None:
-        return Notice(
-            code=NoticeCode.MEMORY_LIMIT_UNREADABLE,
-            message=f'The memory limit of {raw.unreadable_level} cannot be read, so a tighter limit than '
-            'any this process can see may apply and nothing is reported.',
-        )
+    if raw.unreadable_file is not None:
+        return _unreadable_limit_notice(NoticeCode.MEMORY_LIMIT_UNREADABLE, 'memory', raw.unreadable_file)
 
     if raw.limit is None:
         # No limit and no mechanism read the same way from the outside, and only one of them is a fact about
@@ -634,18 +630,18 @@ def _memory_rejection(raw: RawMemory, ceiling: int | None) -> Notice | None:
         )
 
     if raw.used is None or raw.available is None:
-        return _unpaired_limit_notice(raw.limit, raw.usage_unreadable_level)
+        return _unpaired_limit_notice(raw.limit, raw.usage_unreadable_file)
 
     return None
 
 
-def _unpaired_limit_notice(limit: int, usage_unreadable_level: str | None) -> Notice:
+def _unpaired_limit_notice(limit: int, usage_unreadable_file: str | None) -> Notice:
     """Say why a limit was found with no usage to pair against it, which happens two ways."""
-    if usage_unreadable_level is not None:
+    if usage_unreadable_file is not None:
         return Notice(
             code=NoticeCode.MEMORY_USAGE_UNREADABLE,
-            message=f'Found a memory limit of {limit} bytes, and {usage_unreadable_level} did not say how '
-            'much of it is in use, so the limit is not reported.',
+            message=f'Found a memory limit of {limit} bytes, and the memory usage in {usage_unreadable_file} '
+            'cannot be read, so the limit is not reported.',
         )
 
     return Notice(
@@ -659,16 +655,10 @@ def _evaluate_cpu_limit(machine_cpus: int | None) -> _CpuEvaluation:
     """Judge the raw CPU readings. The tighter of the quota and the set wins."""
     raw = _backend.read_cpu()
 
-    if raw.unreadable_level is not None:
+    if raw.unreadable_file is not None:
         # Both readings are already empty here, and this test is before them so that nothing has to rely on
         # that.
-        return _no_cpu_limit(
-            Notice(
-                code=NoticeCode.CPU_LIMIT_UNREADABLE,
-                message=f'The CPU limit of {raw.unreadable_level} cannot be read, so a tighter limit '
-                'than any this process can see may apply and nothing is reported.',
-            )
-        )
+        return _no_cpu_limit(_unreadable_limit_notice(NoticeCode.CPU_LIMIT_UNREADABLE, 'CPU', raw.unreadable_file))
 
     if raw.unconvertible_level is not None:
         # The other reading is dropped with it, for the same reason an unreadable level drops both: the share
@@ -749,6 +739,11 @@ def _evaluate_cpu_limit(machine_cpus: int | None) -> _CpuEvaluation:
         raw_set_size=cpu_set.cores if cpu_set is not None else None,
         notices=tuple(notices),
     )
+
+
+def _unreadable_limit_notice(code: NoticeCode, metric: str, unreadable_file: str) -> Notice:
+    """Name a limit that cannot be read, which drops the raw reading."""
+    return Notice(code=code, message=f'The {metric} limit in {unreadable_file} cannot be read, so nothing is reported.')
 
 
 def _no_cpu_limit(notice: Notice) -> _CpuEvaluation:

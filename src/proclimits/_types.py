@@ -36,6 +36,8 @@ class NoticeCode(str, Enum):
     MEMORY_USAGE_UNREADABLE = 'memory-usage-unreadable'
     """A limit was found, and the level that carries the usage to pair with it did not answer.
 
+    The message names the file and the reason, or on Windows the job query and its error code.
+
     A read that failed, so it can come and go, and something on this machine is worth looking into. An
     ancestor cgroup that holds a limit and no readable `memory.current` raises it.
     """
@@ -80,10 +82,16 @@ class NoticeCode(str, Enum):
     """
 
     MEMORY_LIMIT_UNREADABLE = 'memory-limit-unreadable'
-    """A level holds a memory limit that says nothing usable, so what it enforces is unknown."""
+    """A level holds a memory limit that says nothing usable, so what it enforces is unknown.
+
+    The message names the file and the reason, or on Windows the job query and its error code.
+    """
 
     CPU_LIMIT_UNREADABLE = 'cpu-limit-unreadable'
-    """A level holds a CPU limit that says nothing usable, so what it enforces is unknown."""
+    """A level holds a CPU limit that says nothing usable, so what it enforces is unknown.
+
+    The message names the file and the reason, or on Windows the job query and its error code.
+    """
 
     MEMORY_ANCESTORS_HIDDEN = 'memory-ancestors-hidden'
     """Only part of the memory hierarchy is visible, so a limit above it is enforced but never read."""
@@ -205,22 +213,23 @@ class RawMemory:
     number alone therefore does not say which level it came from.
     """
 
-    unreadable_level: str | None
-    """The level whose limit says nothing usable, or `None` when every level answered.
+    unreadable_file: str | None
+    """The closest limit that says nothing usable, and why. `None` when every limit answered.
 
-    The reading is dropped when this is set, rather than falling back to a level that did answer: every such
-    level is looser, and the mechanism enforces the one that did not.
+    Under a cgroup this is a file, with an errno name or what its content lacks. Under a job object it is a
+    query, with the code it failed with. The reading is dropped when this is set, rather than falling back to a
+    level that did answer: every such level is looser, and the mechanism enforces the one that did not.
     """
 
-    usage_unreadable_level: str | None
-    """The level that carries a usage figure and did not answer with one, or `None`.
+    usage_unreadable_file: str | None
+    """The closest usage that cannot be read at a level holding a limit, and why, or `None`.
 
-    Only ever set alongside a `used` of `None`, where it tells the two empty pairs apart. Set, a read failed
-    and may succeed on the next call. `None`, the limit is of a kind this mechanism pairs no usage with at
-    all.
+    Spelled as `unreadable_file` is. Only ever set alongside a `used` of `None`, where it tells the two empty
+    pairs apart. Set, a read failed and may succeed on the next call. `None`, the limit is of a kind this
+    mechanism pairs no usage with at all.
 
     Beside a `used` that was filled it is `None` as well, and means nothing there: no read failed, so there is
-    no level to name.
+    nothing to name.
     """
 
     unlocated_file: str | None
@@ -287,11 +296,11 @@ class RawCpu:
     cpu_set: RawCpuSet | None
     """The set of allowed cores, or `None` when no level sets one."""
 
-    unreadable_level: str | None
-    """The level whose CPU control says nothing usable, or `None` when every level answered.
+    unreadable_file: str | None
+    """The CPU control that says nothing usable, and why. `None` when every control answered.
 
-    Both readings are dropped when this is set. The control exists, so what it holds is unknown rather than
-    absent, and an ancestor's looser number is not a substitute for it.
+    Spelled as `RawMemory.unreadable_file` is. Both readings are dropped when this is set. The control exists, so
+    what it holds is unknown rather than absent, and an ancestor's looser number is not a substitute for it.
     """
 
     unconvertible_level: str | None

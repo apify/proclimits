@@ -147,34 +147,24 @@ _V1_CONTROLLER_NAMES = frozenset({_V1_CPU_ACCT, *(metric.v1_controller for metri
 
 
 class _UnreadableFileError(Exception):
-    """A control file is there, and says nothing this module can use.
+    """A control file says nothing this module can use.
 
-    The reader turns it into a reading of nothing plus the name of that level, so a looser ancestor limit is
-    never reported in its place.
+    The error prints as the file and the reason, which is how a notice names it.
     """
 
-    def __init__(self, directory: Path) -> None:
-        super().__init__(f'{directory} holds a control file that says nothing usable')
-        self.directory = directory
-        """The level that could not be read."""
+    def __init__(self, path: Path, reason: str) -> None:
+        super().__init__(f'{path} ({reason})')
 
 
 class _UnreadableProcFileError(Exception):
     """A `/proc` file that discovery reads failed for a reason other than its absence.
 
     The error the read raised may name no file. One raised after the file was opened does not, and neither does
-    a `ValueError`. So this error prints as the file and the reason. The reason is the errno name where there is
-    one, and the kind of error otherwise.
+    a `ValueError`. So this error prints as the file and the reason.
     """
 
     def __init__(self, path: Path, error: OSError | ValueError) -> None:
-        # The errno tells a process out of file descriptors, EMFILE, from a file nobody may read, EACCES.
-        reason = (
-            errno.errorcode.get(error.errno, str(error.errno))
-            if isinstance(error, OSError) and error.errno is not None
-            else type(error).__name__
-        )
-        super().__init__(f'{path} ({reason})')
+        super().__init__(f'{path} ({_failure_reason(error)})')
 
 
 @dataclass(frozen=True)
@@ -310,6 +300,9 @@ class _MemoryLevel:
     usage: _MemoryUsage | None
     """What that level is charged, or `None` when it cannot be read."""
 
+    unreadable_usage: str | None
+    """The usage file of that level that cannot be read, and why. `None` where `usage` was read there."""
+
     directory: Path
     """The cgroup the two were read from."""
 
@@ -336,13 +329,13 @@ _NO_MEMORY = RawMemory(
     available=None,
     unflushed_cache=None,
     limit_level=None,
-    unreadable_level=None,
-    usage_unreadable_level=None,
+    unreadable_file=None,
+    usage_unreadable_file=None,
     unlocated_file=None,
 )
 """What is reported where no level holds a memory limit that counts."""
 
-_NO_CPU = RawCpu(quota=None, cpu_set=None, unreadable_level=None, unconvertible_level=None, unlocated_file=None)
+_NO_CPU = RawCpu(quota=None, cpu_set=None, unreadable_file=None, unconvertible_level=None, unlocated_file=None)
 """Nothing read. A reading that fails adds what it could not read."""
 
 
@@ -379,8 +372,8 @@ def read_memory(*, throttle_limits: bool = False) -> RawMemory:
             available=None,
             unflushed_cache=None,
             limit_level=None,
-            unreadable_level=str(unreadable.directory),
-            usage_unreadable_level=None,
+            unreadable_file=str(unreadable),
+            usage_unreadable_file=None,
             unlocated_file=None,
         )
 
@@ -401,8 +394,8 @@ def read_memory(*, throttle_limits: bool = False) -> RawMemory:
             available=None,
             unflushed_cache=None,
             limit_level=str(tightest.directory),
-            unreadable_level=None,
-            usage_unreadable_level=str(min_distance_level.directory),
+            unreadable_file=None,
+            usage_unreadable_file=min_distance_level.unreadable_usage,
             unlocated_file=None,
         )
 
@@ -412,8 +405,8 @@ def read_memory(*, throttle_limits: bool = False) -> RawMemory:
         available=min_distance_level.available,
         unflushed_cache=min_distance_level.usage.unflushed_cache,
         limit_level=str(tightest.directory),
-        unreadable_level=None,
-        usage_unreadable_level=None,
+        unreadable_file=None,
+        usage_unreadable_file=None,
         unlocated_file=None,
     )
 
@@ -437,24 +430,41 @@ def _read_memory_levels(controller: Controller, *, throttle_limits: bool) -> lis
         # `mem_cgroup_wb_stats` in mm/memcontrol.c takes `min(memory.max, memory.high)` as the ceiling of each
         # level when it works out the room left. Where both are read, the tighter of the two is the limit of the
         # level here too.
-        limits = [found for name in limit_files if (found := _read_limit(directory / name)) is not None]
+        limits = [found for name in limit_files if (found := _read_memory_limit(directory / name)) is not None]
         if not limits:
             continue
 
-        limit = min(limits)
+        try:
+            usage = _read_memory_usage(controller, directory)
+        except _UnreadableFileError as unreadable:
+            levels.append(
+                _MemoryLevel(limit=min(limits), usage=None, unreadable_usage=str(unreadable), directory=directory)
+            )
+            continue
 
-        # Zero is a limit, and the tightest one a cgroup can hold. A negative number of bytes is not a limit
-        # at all, and no kernel writes one - so it is a file this module cannot use rather than an absent one.
-        if limit < 0:
-            raise _UnreadableFileError(directory)
-
-        levels.append(_MemoryLevel(limit=limit, usage=_read_memory_usage(controller, directory), directory=directory))
+        levels.append(_MemoryLevel(limit=min(limits), usage=usage, unreadable_usage=None, directory=directory))
 
     return levels
 
 
+def _read_memory_limit(path: Path) -> int | None:
+    """Read a file holding a memory limit, in bytes. `None` when the file is absent or spells `max`.
+
+    Raises:
+        _UnreadableFileError: If the file is there and cannot be read, or holds no number of bytes.
+    """
+    limit = _read_limit(path)
+
+    # Zero is a limit, and the tightest one a cgroup can hold. A negative number of bytes is not a limit at all,
+    # and no kernel writes one - so it is a file this module cannot use rather than an absent one.
+    if limit is not None and limit < 0:
+        raise _UnreadableFileError(path, 'holds a negative number')
+
+    return limit
+
+
 def read_cpu() -> RawCpu:
-    """Read both CPU restrictions, and the level that said nothing usable if there was one.
+    """Read both CPU restrictions, and the control file that said nothing usable if there was one.
 
     Where a `/proc` file keeps the controllers from being located, nothing is read and `unlocated_file` names it.
     """
@@ -468,12 +478,12 @@ def read_cpu() -> RawCpu:
         return RawCpu(
             quota=read_cpu_quota(controllers),
             cpu_set=read_cpu_set_size(controllers),
-            unreadable_level=None,
+            unreadable_file=None,
             unconvertible_level=None,
             unlocated_file=None,
         )
     except _UnreadableFileError as unreadable:
-        return replace(_NO_CPU, unreadable_level=str(unreadable.directory))
+        return replace(_NO_CPU, unreadable_file=str(unreadable))
 
 
 def read_cpu_quota(controllers: Controllers) -> RawCpuQuota | None:
@@ -550,14 +560,15 @@ def _read_cpu_set(directory: Path, controller: Controller) -> int | None:
     """Count the cores one level allows. `None` when it sets none.
 
     Raises:
-        _UnreadableFileError: If a file is there and holds no list of cores.
+        _UnreadableFileError: If a file is there and cannot be read, or holds no list of cores.
     """
     # The effective file first: under cgroup v1 the configured one is empty where the set is inherited, and old
     # kernels have only the configured one.
     names = (controller.names.cpu_set,) if controller.is_v2 else (_V1_CPU_SET_EFFECTIVE, controller.names.cpu_set)
 
     for name in names:
-        cpu_list = _read_control_file(directory / name)
+        path = directory / name
+        cpu_list = _read_control_file(path)
         if cpu_list is None:
             continue
 
@@ -567,7 +578,7 @@ def _read_cpu_set(directory: Path, controller: Controller) -> int | None:
 
         cores = count_cpu_list(cpu_list)
         if cores is None:
-            raise _UnreadableFileError(directory)
+            raise _UnreadableFileError(path, 'holds no list of cores')
 
         return cores
 
@@ -618,8 +629,8 @@ def locate_controllers() -> Controllers:
     """
     try:
         return _discover_controllers()
-    except _UnreadableProcFileError as unreadable:
-        return replace(_NO_CONTROLLERS, unlocated_file=str(unreadable))
+    except _UnreadableProcFileError as error:
+        return replace(_NO_CONTROLLERS, unlocated_file=str(error))
 
 
 @lru_cache(maxsize=1)
@@ -857,33 +868,31 @@ def _cpu_usage_level(directory: Path, source: Controller, usage: Controller | No
     return str(translated) if _exists(translated / usage.names.cpu_usage) else None
 
 
-def _read_memory_usage(controller: Controller, directory: Path) -> _MemoryUsage | None:
+def _read_memory_usage(controller: Controller, directory: Path) -> _MemoryUsage:
     """Read what one cgroup is charged, crediting back the inactive file cache the kernel can drop.
 
     The pages waiting to be written to disk come off that credit. They cannot be dropped until they reach the
     disk. `docker stats` credits the whole inactive cache instead. Measured on cgroup v2, that is too much: a
     process that allocated the room reported right after an unsynced write burst was OOM-killed. The active
     file cache is reclaimable too and stays counted, as it does in `docker stats`.
+
+    Raises:
+        _UnreadableFileError: If a file the charge is read from is absent or cannot be read, or lacks the number
+            it is read for.
     """
     names = controller.names
 
-    current = _read_counter(directory / names.memory_usage)
-    if current is None:
-        return None
+    current = _read_number(directory / names.memory_usage)
 
     # Read after the charge. Near the limit reclaim shrinks the cache, so a later reading leans to less credit.
     # One parse for the three keys, so they describe one instant.
-    stat = _read_stat_values(
-        directory / names.memory_stat,
-        (names.inactive_file, names.file_dirty, names.file_writeback),
-    )
-    if stat is None:
-        return None
+    stat_path = directory / names.memory_stat
+    stat = _read_stat_values(stat_path, (names.inactive_file, names.file_dirty, names.file_writeback))
 
     # No fallback to the raw usage. That would count the inactive file cache as usage.
     inactive_file = stat.get(names.inactive_file)
     if inactive_file is None:
-        return None
+        raise _UnreadableFileError(stat_path, f'has no {names.inactive_file}')
 
     dirty = stat.get(names.file_dirty)
     writeback = stat.get(names.file_writeback)
@@ -1156,9 +1165,11 @@ def _read_cpu_quota_v2(directory: Path) -> float | None:
     """Read the cores allowed by a cgroup v2 `cpu.max` file, which holds the quota and its period.
 
     Raises:
-        _UnreadableFileError: If the file is there and describes no bandwidth this module can use.
+        _UnreadableFileError: If the file is there and cannot be read, or describes no bandwidth this module can
+            use.
     """
-    content = _read_control_file(directory / _V2.cpu_quota)
+    path = directory / _V2.cpu_quota
+    content = _read_control_file(path)
     if content is None:
         return None
 
@@ -1170,11 +1181,11 @@ def _read_cpu_quota_v2(directory: Path) -> float | None:
     try:
         quota, period = int(written), int(period_written)
     except ValueError:
-        raise _UnreadableFileError(directory) from None
+        raise _UnreadableFileError(path, 'holds no quota and period') from None
 
     # Neither can be zero or negative on a real kernel, and cgroup v2 has `max` for "no quota".
     if quota <= 0 or period <= 0:
-        raise _UnreadableFileError(directory)
+        raise _UnreadableFileError(path, 'holds a quota or period of zero or less')
 
     return quota / period
 
@@ -1183,10 +1194,11 @@ def _read_cpu_quota_v1(directory: Path) -> float | None:
     """Read the cores allowed by the cgroup v1 quota and period files.
 
     Raises:
-        _UnreadableFileError: If a file is there and describes no bandwidth this module can use.
+        _UnreadableFileError: If a file is there and cannot be read, or describes no bandwidth this module can use.
     """
-    quota = _read_limit(directory / _V1.cpu_quota)
-    period = _read_limit(directory / _V1_CPU_PERIOD)
+    quota_path, period_path = directory / _V1.cpu_quota, directory / _V1_CPU_PERIOD
+    quota = _read_limit(quota_path)
+    period = _read_limit(period_path)
     if quota is None or period is None:
         return None
 
@@ -1194,18 +1206,13 @@ def _read_cpu_quota_v1(directory: Path) -> float | None:
     if quota < 0:
         return None
 
-    if quota == 0 or period <= 0:
-        raise _UnreadableFileError(directory)
+    if quota == 0:
+        raise _UnreadableFileError(quota_path, 'holds zero')
+
+    if period <= 0:
+        raise _UnreadableFileError(period_path, 'holds zero or less')
 
     return quota / period
-
-
-def _read_text(path: Path) -> str | None:
-    """Read a control file. `None` when it cannot be read at all."""
-    try:
-        return path.read_text().strip()
-    except (OSError, ValueError):
-        return None
 
 
 def _read_control_file(path: Path) -> str | None:
@@ -1214,34 +1221,60 @@ def _read_control_file(path: Path) -> str | None:
     Raises:
         _UnreadableFileError: If the file is there and cannot be read.
     """
-    content = _read_text(path)
-    if content is None and _exists(path):
-        raise _UnreadableFileError(path.parent)
+    try:
+        return path.read_text().strip()
+    except (OSError, ValueError) as error:
+        if not _exists(path):
+            return None
 
-    return content
+        raise _UnreadableFileError(path, _failure_reason(error)) from None
+
+
+def _failure_reason(error: OSError | ValueError) -> str:
+    """Name why a read failed: the errno name where there is one, the kind of error otherwise.
+
+    A stat needs no file descriptor, so a process out of them still sees the file it cannot open. The errno
+    tells that, EMFILE, from a file nobody may read, EACCES.
+    """
+    if isinstance(error, OSError) and error.errno is not None:
+        return errno.errorcode.get(error.errno, str(error.errno))
+
+    return type(error).__name__
 
 
 def _read_counter(path: Path) -> int | None:
     """Read a counter, best effort. `None` when it cannot be read or says anything but a number.
 
-    A counter has no looser value to fall back to, which is what makes best effort right here and wrong for a
-    limit.
+    For the CPU time read here, a counter that is missing and one that cannot be read mean the same. A limit
+    and a memory usage are read strictly instead, so a file that cannot be read is named.
     """
-    content = _read_text(path)
-    if content is None:
+    try:
+        return _read_number(path)
+    except _UnreadableFileError:
         return None
+
+
+def _read_number(path: Path) -> int:
+    """Read a file holding one number.
+
+    Raises:
+        _UnreadableFileError: If the file is absent or cannot be read, or holds no number.
+    """
+    content = _read_control_file(path)
+    if content is None:
+        raise _UnreadableFileError(path, 'absent')
 
     try:
         return int(content)
     except ValueError:
-        return None
+        raise _UnreadableFileError(path, 'holds no number') from None
 
 
 def _read_limit(path: Path) -> int | None:
     """Read a file holding a limit. `None` when the file is absent or spells `max`.
 
     Raises:
-        _UnreadableFileError: If the file is there and holds no number this module can use.
+        _UnreadableFileError: If the file is there and cannot be read, or holds no number.
     """
     content = _read_control_file(path)
     if content is None or content == _V2_UNLIMITED:
@@ -1250,21 +1283,27 @@ def _read_limit(path: Path) -> int | None:
     try:
         return int(content)
     except ValueError:
-        raise _UnreadableFileError(path.parent) from None
+        raise _UnreadableFileError(path, 'holds no number') from None
 
 
 def _read_stat_value(path: Path, key: str) -> int | None:
-    """Read one entry of a control file holding `<key> <value>` lines."""
-    values = _read_stat_values(path, (key,))
+    """Read one entry of a control file holding `<key> <value>` lines, best effort."""
+    try:
+        values = _read_stat_values(path, (key,))
+    except _UnreadableFileError:
+        return None
 
-    return values.get(key) if values is not None else None
+    return values.get(key)
 
 
-def _read_stat_values(path: Path, keys: tuple[str, ...]) -> dict[str, int] | None:
+def _read_stat_values(path: Path, keys: tuple[str, ...]) -> dict[str, int]:
     """Read several entries of a control file holding `<key> <value>` lines, in one pass.
 
     Returns:
-        An entry for each of `keys` that the file carries a number for, or `None` where the file cannot be read.
+        An entry for each of `keys` that the file carries a number for.
+
+    Raises:
+        _UnreadableFileError: If the file is absent or cannot be read.
     """
     found: dict[str, int] = {}
 
@@ -1282,7 +1321,7 @@ def _read_stat_values(path: Path, keys: tuple[str, ...]) -> dict[str, int] | Non
 
                 if len(found) == len(keys):
                     break
-    except (OSError, ValueError):
-        return None
+    except (OSError, ValueError) as error:
+        raise _UnreadableFileError(path, _failure_reason(error) if _exists(path) else 'absent') from None
 
     return found
