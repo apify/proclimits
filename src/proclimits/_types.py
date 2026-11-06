@@ -5,11 +5,9 @@ from enum import Enum
 
 
 class NoticeCode(str, Enum):
-    """Why a reading was dropped, why a rate cannot be measured, or what the mechanism cannot see.
+    """Why a reading was dropped, why a rate cannot be measured, or what could not be read or seen.
 
-    Most accompany a reading that was dropped. The `*_ANCESTORS_HIDDEN` pair reports a mount that exposes only a
-    subtree of a hierarchy. It follows from what the mechanism exposes rather than from a reading, so it
-    appears whether or not one was made, and what was read may be looser than what applies.
+    Several can accompany one reading.
 
     Compare against these rather than against the strings they carry: the strings are what a log line shows,
     the members are what code should branch on.
@@ -82,22 +80,31 @@ class NoticeCode(str, Enum):
     """
 
     MEMORY_LIMIT_UNREADABLE = 'memory-limit-unreadable'
-    """A level holds a memory limit that says nothing usable, so what it enforces is unknown.
+    """A memory limit cannot be read, so it is left out.
 
-    The message names the file and the reason, or on Windows the job query and its error code.
+    A tighter limit than the one read may apply. Where no other limit can be read, nothing is reported. The
+    message names the file and the reason, or on Windows the job query and its error code.
     """
 
     CPU_LIMIT_UNREADABLE = 'cpu-limit-unreadable'
-    """A level holds a CPU limit that says nothing usable, so what it enforces is unknown.
+    """A CPU limit cannot be read, so it is left out.
 
-    The message names the file and the reason, or on Windows the job query and its error code.
+    A tighter limit than the one read may apply. Where no other limit can be read, nothing is reported. On
+    Windows a CPU control that will not answer drops both restrictions, so nothing is reported there either. The
+    message names the file and the reason, or on Windows the job query and its error code.
     """
 
     MEMORY_ANCESTORS_HIDDEN = 'memory-ancestors-hidden'
-    """Only part of the memory hierarchy is visible, so a limit above it is enforced but never read."""
+    """Only part of the memory hierarchy is visible, so a limit above it is enforced but never read.
+
+    It follows from the mount, not from a reading. It appears whether or not a limit is reported.
+    """
 
     CPU_ANCESTORS_HIDDEN = 'cpu-ancestors-hidden'
-    """Only part of a CPU hierarchy is visible, so a limit above it is enforced but never read."""
+    """Only part of a CPU hierarchy is visible, so a limit above it is enforced but never read.
+
+    It follows from the mount, not from a reading. It appears whether or not a limit is reported.
+    """
 
 
 @dataclass(frozen=True)
@@ -182,7 +189,7 @@ class RawMemory:
     """
 
     limit: int | None
-    """The tightest limit along the chain, in bytes. `None` when no level holds one.
+    """The tightest limit along the chain, in bytes. `None` when no level holds one that can be read.
 
     Taken as read: cgroup v1 spells "no limit" as a sentinel near 2**63, and it passes through here.
     """
@@ -207,18 +214,18 @@ class RawMemory:
     """
 
     limit_level: str | None
-    """The level holding `limit`, or `None` when no level holds one.
+    """The level holding `limit`, or `None` when no level holds one that can be read.
 
     The whole chain is walked and the tightest limit wins, which is often not the level of this process. The
     number alone therefore does not say which level it came from.
     """
 
     unreadable_file: str | None
-    """The closest limit that says nothing usable, and why. `None` when every limit answered.
+    """The closest limit that cannot be read, and why. `None` when every limit answered.
 
-    Under a cgroup this is a file, with an errno name or what its content lacks. Under a job object it is a
-    query, with the code it failed with. The reading is dropped when this is set, rather than falling back to a
-    level that did answer: every such level is looser, and the mechanism enforces the one that did not.
+    Under a cgroup this is a file, with an errno name, the kind of error, or what its content lacks. Under a job
+    object it is a query, with the code it failed with. That limit is left out, as one on a hidden level is. The
+    other fields come from the limits that answered, so a tighter limit than `limit` may apply.
     """
 
     usage_unreadable_file: str | None
@@ -286,21 +293,21 @@ class RawCpuSet:
 class RawCpu:
     """Everything the CPU controls say, read in one go.
 
-    A level that says nothing usable concerns both restrictions, so they are read together. Where
-    `unlocated_file` is set, no level was read and every other field is `None`.
+    Where `unlocated_file` is set, no level was read and every other field is `None`.
     """
 
     quota: RawCpuQuota | None
-    """The bandwidth quota, or `None` when no level sets one."""
+    """The bandwidth quota, or `None` when no level sets one that can be read."""
 
     cpu_set: RawCpuSet | None
-    """The set of allowed cores, or `None` when no level sets one."""
+    """The set of allowed cores, or `None` when no level sets one or it cannot be read."""
 
     unreadable_file: str | None
-    """The CPU control that says nothing usable, and why. `None` when every control answered.
+    """A CPU control that cannot be read, and why. `None` when every control answered.
 
-    Spelled as `RawMemory.unreadable_file` is. Both readings are dropped when this is set. The control exists, so
-    what it holds is unknown rather than absent, and an ancestor's looser number is not a substitute for it.
+    Spelled as `RawMemory.unreadable_file` is. Under a cgroup this is the closest quota file that failed, else the
+    set file. That control is left out. Whatever is reported comes from the controls that answered, and may be
+    looser than what applies. Under a job object both restrictions are then `None`.
     """
 
     unconvertible_level: str | None

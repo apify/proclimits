@@ -14,13 +14,15 @@ Off Linux and Windows every limit reads as `None`. macOS still reports the memor
 
 ## How it reads a limit
 
-In both mechanisms a limit sits on a level above the process: on Linux any cgroup in the chain above it, on Windows the job it was assigned to. This package reads every level it can see and reports the tightest limit among them. Three things follow, and they run through everything below.
+In both mechanisms a limit sits on a level above the process: on Linux any cgroup in the chain above it, on Windows the job it was assigned to. This package reads every level it can see and reports the tightest limit among them. Four things follow, and they run through everything below.
 
 **A reported number can describe a level above this process.** Everything under that level shares the limit. The memory of sibling groups is charged against it, and its CPU quota throttles them all. `describe()` names the level each reading came from: `memory_limit_level` for the memory limit, `cpu_limit_level` for the CPU one.
 
 **A limit that restricts nothing is dropped rather than reported.** An unrestricted group still holds a number that looks like a limit: cgroup v1 spells "no limit" as a sentinel near 2\*\*63, a CPU quota can exceed the cores of the machine, and a CPU set can cover every core of it. Every reading is therefore compared against the machine, and one that turns out to restrict nothing is dropped. The answer is then `None`, and `describe().notices` says which reading was dropped and why.
 
 **A limit this process cannot see is not reported.** A container can be given a subtree as its whole cgroup filesystem, a [cgroup namespace](https://man7.org/linux/man-pages/man7/cgroup_namespaces.7.html) can hide the levels above the process, and a Windows job can [sit inside another](https://learn.microsoft.com/en-us/windows/win32/procthread/nested-jobs). A limit there is still enforced, and nothing here can read it. The first is reported as a `*_ANCESTORS_HIDDEN` notice. The other two raise no notice, so the absence of that notice is not a guarantee.
+
+**A limit that cannot be read is left out the same way.** A cgroup file can be there and say nothing usable: a `chmod` makes it unreadable, and a hand-built tree can hold anything. What that file holds is left out, and the reading comes from the files that can be read. On Windows a CPU control that will not answer drops both CPU restrictions. A `*_LIMIT_UNREADABLE` notice names the file and the reason, or on Windows the job query and its error code.
 
 ### On Linux
 
@@ -199,5 +201,5 @@ A limit of `None` with no notice about it means nothing went wrong: the mechanis
 | `CPU_METRICS_UNREADABLE` | the same for a CPU limit | the same |
 | `MEMORY_ANCESTORS_HIDDEN` | only part of the memory hierarchy is visible, so a limit above it is enforced but unreadable | a container given a subtree as its whole `/sys/fs/cgroup` |
 | `CPU_ANCESTORS_HIDDEN` | only part of a CPU hierarchy is visible | the same |
-| `MEMORY_LIMIT_UNREADABLE` | a level holds a memory limit that says nothing usable, so what it enforces is unknown | a hand-built or mocked cgroup tree; no kernel writes such a value |
-| `CPU_LIMIT_UNREADABLE` | the same for a CPU limit | the same, plus a `cpuset.cpus` no kernel writes, such as the overlapping `0-2,1-3` |
+| `MEMORY_LIMIT_UNREADABLE` | a memory limit cannot be read, so it is left out and a tighter limit than the one read may apply; where no other can be read, nothing is reported | a limit file made unreadable with `chmod`, or a hand-built tree holding a value no kernel writes |
+| `CPU_LIMIT_UNREADABLE` | the same for a CPU limit; on Windows a control that will not answer drops both restrictions | the same, plus a `cpuset.cpus` no kernel writes, such as the overlapping `0-2,1-3` |

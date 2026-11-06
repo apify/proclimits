@@ -127,12 +127,21 @@ for a second reason - `os.cpu_count()` honors `PYTHON_CPU_COUNT` and `-X cpu_cou
 this count does not only check a reading here, it decides the rates and masks the lane sets.
 """
 
-INFORMATIONAL_NOTICES = frozenset({'memory-ancestors-hidden', 'cpu-ancestors-hidden'})
-"""Notices that report what the mechanism cannot see.
+INFORMATIONAL_NOTICES = frozenset(
+    {
+        'memory-ancestors-hidden',
+        'cpu-ancestors-hidden',
+        'memory-limit-unreadable',
+        'cpu-limit-unreadable',
+    }
+)
+"""Notices that report what a reading could not see or read, rather than why it is missing.
 
-The shape of the mount raises them, so they explain no `None`. Kept apart because the check that a missing
-reading was explained would otherwise be satisfied by a notice that explains something else - and on a
-truncated mount, which is a shape the container lane builds, it would be satisfied every time.
+The `*_ANCESTORS_HIDDEN` pair follows from the shape of the mount. The `*_LIMIT_UNREADABLE` pair names a limit
+left out of a reading made from the rest, and where that leaves nothing reported, the raw values are `None` too.
+So none of them explains a `None` beside a raw value. Kept apart because the check that a missing reading was
+explained would otherwise be satisfied by a notice that explains something else - and on a truncated mount,
+which is a shape the container lane builds, it would be satisfied every time.
 """
 
 DERIVED_AVAILABLE = frozenset({'cgroup-v1', 'cgroup-v2'})

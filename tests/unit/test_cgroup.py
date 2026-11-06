@@ -612,7 +612,9 @@ def test_read_memory(
     """Reads the memory limit under both cgroup interfaces."""
     fake_cgroup(mountinfo=mountinfo, self_cgroup=self_cgroup, files=files)
 
-    assert cgroup.read_memory().limit == expected
+    raw = cgroup.read_memory()
+
+    assert (raw.limit, raw.unreadable_file) == (expected, None)
 
 
 @pytest.mark.parametrize(
@@ -709,9 +711,36 @@ def test_read_memory_does_not_open_memory_high_by_default(fake_cgroup: Callable[
         usage_unreadable_file=None,
         unlocated_file=None,
     )
-    # The same file voids the reading once it is asked for.
-    expected = f'{root / "memory.high"} ({OPENING_A_DIRECTORY})'
-    assert cgroup.read_memory(throttle_limits=True).unreadable_file == expected
+    # Once asked for, the same file is left out and named.
+    raw = cgroup.read_memory(throttle_limits=True)
+
+    assert raw.unreadable_file == f'{root / "memory.high"} ({OPENING_A_DIRECTORY})'
+    assert (raw.limit, raw.limit_level) == (1000, str(root))
+
+
+def test_read_memory_names_memory_max_where_neither_limit_of_a_level_can_be_read(
+    fake_cgroup: Callable[..., Path],
+) -> None:
+    """Names `memory.max` where both limits of one level fail, because it is read first."""
+    root = fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/pod'),
+        files={
+            'pod/memory.current': '100\n',
+            'pod/memory.stat': 'inactive_file 0\n',
+            'memory.max': '2000\n',
+            'memory.current': '300\n',
+            'memory.stat': 'inactive_file 0\n',
+        },
+    )
+    # Directories in place of both files, so both are there and neither can be read.
+    (root / 'pod' / 'memory.max').mkdir()
+    (root / 'pod' / 'memory.high').mkdir()
+
+    raw = cgroup.read_memory(throttle_limits=True)
+
+    assert raw.unreadable_file == f'{root / "pod" / "memory.max"} ({OPENING_A_DIRECTORY})'
+    assert (raw.limit, raw.limit_level) == (2000, str(root))
 
 
 def test_read_memory_tightest_level(fake_cgroup: Callable[..., Path]) -> None:
@@ -1063,6 +1092,13 @@ def test_read_memory_missing_files(fake_cgroup: Callable[..., Path]) -> None:
             None,
             id='v1 unlimited',
         ),
+        pytest.param(
+            V1_MOUNTINFO,
+            V1_SELF_CGROUP.format(path='/'),
+            {'cpu,cpuacct/cpu.cfs_quota_us': '150000\n', 'cpu,cpuacct/cpuacct.usage': '0\n'},
+            None,
+            id='v1 quota without a period',
+        ),
     ],
 )
 def test_read_cpu_quota(
@@ -1075,9 +1111,9 @@ def test_read_cpu_quota(
     """Reads the CPU bandwidth quota under both cgroup interfaces."""
     fake_cgroup(mountinfo=mountinfo, self_cgroup=self_cgroup, files=files)
 
-    quota = cgroup.read_cpu_quota(cgroup.locate_controllers())
+    quota, unreadable_file = cgroup.read_cpu_quota(cgroup.locate_controllers())
 
-    assert (quota.cores if quota is not None else None) == expected
+    assert (quota.cores if quota is not None else None, unreadable_file) == (expected, None)
 
 
 @pytest.mark.parametrize(
@@ -1123,9 +1159,9 @@ def test_read_cpu_set_size(
     """Counts the cores of a CPU set spelled as a mix of ranges and single numbers."""
     fake_cgroup(mountinfo=mountinfo, self_cgroup=self_cgroup, files=files)
 
-    cpu_set = cgroup.read_cpu_set_size(cgroup.locate_controllers())
+    cpu_set, unreadable_file = cgroup.read_cpu_set_size(cgroup.locate_controllers())
 
-    assert (cpu_set.cores if cpu_set is not None else None) == expected
+    assert (cpu_set.cores if cpu_set is not None else None, unreadable_file) == (expected, None)
 
 
 def test_read_cpu_set_size_unparsable_entry(fake_cgroup: Callable[..., Path]) -> None:
@@ -1177,18 +1213,68 @@ def test_read_cpu_set_size_file_disappears(fake_cgroup: Callable[..., Path]) -> 
         self_cgroup=V2_SELF_CGROUP.format(path='/'),
         files={'cpuset.cpus.effective': '0-1\n'},
     )
-    cpu_set = cgroup.read_cpu_set_size(cgroup.locate_controllers())
+    cpu_set, unreadable_file = cgroup.read_cpu_set_size(cgroup.locate_controllers())
 
+    assert unreadable_file is None
     assert cpu_set is not None
     assert cpu_set.cores == 2
 
     (root / 'cpuset.cpus.effective').unlink()
 
-    assert cgroup.read_cpu_set_size(cgroup.locate_controllers()) is None
+    assert cgroup.read_cpu_set_size(cgroup.locate_controllers()) == (None, None)
+
+
+@pytest.mark.parametrize(
+    'error',
+    [
+        pytest.param(FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT)), id='no such file'),
+        pytest.param(NotADirectoryError(errno.ENOTDIR, os.strerror(errno.ENOTDIR)), id='a file where a directory was'),
+    ],
+)
+def test_read_cpu_set_size_file_vanishing_before_the_read(
+    fake_cgroup: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    error: OSError,
+) -> None:
+    """Reads a set file as absent where opening it fails as it does once the file or its level is gone."""
+    root = fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/'),
+        files={'cpuset.cpus.effective': '0-1\n', 'cpu.stat': 'usage_usec 0\n'},
+    )
+    fail_to_read(monkeypatch, root / 'cpuset.cpus.effective', error, times=None)
+
+    assert cgroup.read_cpu() == cgroup.RawCpu(
+        quota=None, cpu_set=None, unreadable_file=None, unconvertible_level=None, unlocated_file=None
+    )
+
+
+def test_read_memory_absent_limit_file_out_of_descriptors(
+    fake_cgroup: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reads an absent limit file as absent where opening it fails for want of file descriptors."""
+    root = fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/pod/container'),
+        files={
+            'pod/container/memory.current': '1000\n',
+            'pod/container/memory.stat': 'inactive_file 0\n',
+            'pod/memory.max': '268435456\n',
+            'pod/memory.current': '9000\n',
+            'pod/memory.stat': 'inactive_file 0\n',
+        },
+    )
+    # Out of descriptors, opening a file that is not there fails with EMFILE rather than ENOENT.
+    fail_to_read(monkeypatch, root / 'pod' / 'container' / 'memory.max', emfile(), times=None)
+
+    raw = cgroup.read_memory()
+
+    assert (raw.limit, raw.unreadable_file) == (268435456, None)
 
 
 def test_read_cpu_set_size_unreadable_file(fake_cgroup: Callable[..., Path]) -> None:
-    """Names the set file that cannot be read, with the errno, instead of reporting no restriction."""
+    """Leaves out a set file that cannot be read, and names it with the errno."""
     root = fake_cgroup(
         mountinfo=V2_MOUNTINFO,
         self_cgroup=V2_SELF_CGROUP.format(path='/'),
@@ -1284,8 +1370,9 @@ def test_cpu_usage_dir_rejects_a_group_of_the_same_name(fake_cgroup: Callable[..
         },
     )
 
-    quota = cgroup.read_cpu_quota(cgroup.locate_controllers())
+    quota, unreadable_file = cgroup.read_cpu_quota(cgroup.locate_controllers())
 
+    assert unreadable_file is None
     assert quota is not None
     assert quota.cores == 2.0
     assert quota.limit_level == str(root / 'cpu' / 'limited')
@@ -1293,11 +1380,25 @@ def test_cpu_usage_dir_rejects_a_group_of_the_same_name(fake_cgroup: Callable[..
 
 
 @pytest.mark.parametrize(
-    ('unreadable', 'readable', 'options'),
+    ('unreadable', 'readable', 'options', 'expected'),
     [
-        pytest.param('memory.max', 'memory.high', {}, id='memory.max by default'),
-        pytest.param('memory.max', 'memory.high', {'throttle_limits': True}, id='memory.max with throttle limits'),
-        pytest.param('memory.high', 'memory.max', {'throttle_limits': True}, id='memory.high with throttle limits'),
+        # `memory.high` is not opened by default, so the container holds no limit and the pod's 10 GiB holds.
+        pytest.param('memory.max', 'memory.high', {}, (10737418240, 'pod'), id='memory.max by default'),
+        # The limit file beside the unreadable one still holds, so the container keeps its 512 MiB.
+        pytest.param(
+            'memory.max',
+            'memory.high',
+            {'throttle_limits': True},
+            (536870912, 'pod/container'),
+            id='memory.max with throttle limits',
+        ),
+        pytest.param(
+            'memory.high',
+            'memory.max',
+            {'throttle_limits': True},
+            (536870912, 'pod/container'),
+            id='memory.high with throttle limits',
+        ),
     ],
 )
 def test_read_memory_unreadable_limit(
@@ -1305,8 +1406,9 @@ def test_read_memory_unreadable_limit(
     unreadable: str,
     readable: str,
     options: dict[str, bool],
+    expected: tuple[int, str],
 ) -> None:
-    """Names the file whose limit cannot be read, and why, instead of answering with a limit that may be looser."""
+    """Leaves out a limit file that cannot be read, reads on from the limits that can, and names the file and why."""
     root = fake_cgroup(
         mountinfo=V2_MOUNTINFO,
         self_cgroup=V2_SELF_CGROUP.format(path='/pod/container'),
@@ -1321,12 +1423,14 @@ def test_read_memory_unreadable_limit(
         },
     )
 
+    limit, level = expected
+
     assert cgroup.read_memory(**options) == cgroup.RawMemory(
-        limit=None,
-        used=None,
-        available=None,
+        limit=limit,
+        used=100,
+        available=limit - 100,
         unflushed_cache=None,
-        limit_level=None,
+        limit_level=str(root / level),
         unreadable_file=f'{root / "pod" / "container" / unreadable} (holds no number)',
         usage_unreadable_file=None,
         unlocated_file=None,
@@ -1363,7 +1467,7 @@ def test_read_memory_looser_level_without_usage(fake_cgroup: Callable[..., Path]
 
 
 def test_read_memory_limit_file_cannot_be_opened(fake_cgroup: Callable[..., Path]) -> None:
-    """Names a limit file that is there and cannot be opened, with the errno, as for one that holds nonsense."""
+    """Names a limit file that is there and cannot be opened, with the errno, and reads past it."""
     root = fake_cgroup(
         mountinfo=V2_MOUNTINFO,
         self_cgroup=V2_SELF_CGROUP.format(path='/pod/container'),
@@ -1377,8 +1481,10 @@ def test_read_memory_limit_file_cannot_be_opened(fake_cgroup: Callable[..., Path
     # A directory in place of the file, so the file is there and the read fails.
     (root / 'pod' / 'container' / 'memory.max').mkdir()
 
-    expected = f'{root / "pod" / "container" / "memory.max"} ({OPENING_A_DIRECTORY})'
-    assert cgroup.read_memory().unreadable_file == expected
+    raw = cgroup.read_memory()
+
+    assert raw.unreadable_file == f'{root / "pod" / "container" / "memory.max"} ({OPENING_A_DIRECTORY})'
+    assert (raw.limit, raw.limit_level) == (10737418240, str(root / 'pod'))
 
 
 @pytest.mark.parametrize(
@@ -1413,7 +1519,7 @@ def test_read_memory_negative_limit(
 
 
 def test_read_cpu_quota_unreadable_file(fake_cgroup: Callable[..., Path]) -> None:
-    """Names the quota file that cannot be read, and why, instead of answering with a looser ancestor."""
+    """Answers with an ancestor's quota where a closer one cannot be read, and names the file and why."""
     root = fake_cgroup(
         mountinfo=V2_MOUNTINFO,
         self_cgroup=V2_SELF_CGROUP.format(path='/pod/container'),
@@ -1426,7 +1532,7 @@ def test_read_cpu_quota_unreadable_file(fake_cgroup: Callable[..., Path]) -> Non
     )
 
     assert cgroup.read_cpu() == cgroup.RawCpu(
-        quota=None,
+        quota=cgroup.RawCpuQuota(cores=8.0, limit_level=str(root / 'pod'), usage_level=str(root / 'pod')),
         cpu_set=None,
         unreadable_file=f'{root / "pod" / "container" / "cpu.max"} (holds no quota and period)',
         unconvertible_level=None,
@@ -1463,8 +1569,9 @@ def test_read_cpu_set_size_inherited_under_v1(fake_cgroup: Callable[..., Path]) 
         },
     )
 
-    cpu_set = cgroup.read_cpu_set_size(cgroup.locate_controllers())
+    cpu_set, unreadable_file = cgroup.read_cpu_set_size(cgroup.locate_controllers())
 
+    assert unreadable_file is None
     assert cpu_set is not None
     assert cpu_set.cores == 2
     assert cpu_set.limit_level == str(root / 'cpuset' / 'child')
@@ -1478,8 +1585,9 @@ def test_read_cpu_set_size_without_a_counter_of_its_own(fake_cgroup: Callable[..
         files={'cpuset/limited/cpuset.cpus': '0-1\n', 'cpuacct/cpuacct.usage': '5000000000\n'},
     )
 
-    cpu_set = cgroup.read_cpu_set_size(cgroup.locate_controllers())
+    cpu_set, unreadable_file = cgroup.read_cpu_set_size(cgroup.locate_controllers())
 
+    assert unreadable_file is None
     assert cpu_set is not None
     assert cpu_set.cores == 2
     assert cpu_set.usage_level is None
@@ -1497,8 +1605,9 @@ def test_read_cpu_set_size_from_an_ancestor(fake_cgroup: Callable[..., Path]) ->
         },
     )
 
-    cpu_set = cgroup.read_cpu_set_size(cgroup.locate_controllers())
+    cpu_set, unreadable_file = cgroup.read_cpu_set_size(cgroup.locate_controllers())
 
+    assert unreadable_file is None
     assert cpu_set is not None
     assert cpu_set.cores == 2
     # The set restricts the pod, so that is the level it is read at and the one whose time it is measured
@@ -1515,8 +1624,9 @@ def test_read_cpu_set_size_without_any_accounting_hierarchy(fake_cgroup: Callabl
         files={'cpuset/limited/cpuset.cpus': '0-1\n'},
     )
 
-    cpu_set = cgroup.read_cpu_set_size(cgroup.locate_controllers())
+    cpu_set, unreadable_file = cgroup.read_cpu_set_size(cgroup.locate_controllers())
 
+    assert unreadable_file is None
     assert cpu_set is not None
     assert cpu_set.cores == 2
     assert cpu_set.usage_level is None
@@ -1533,8 +1643,9 @@ def test_read_cpu_set_size_across_split_hierarchies(fake_cgroup: Callable[..., P
         },
     )
 
-    cpu_set = cgroup.read_cpu_set_size(cgroup.locate_controllers())
+    cpu_set, unreadable_file = cgroup.read_cpu_set_size(cgroup.locate_controllers())
 
+    assert unreadable_file is None
     assert cpu_set is not None
     assert cpu_set.limit_level == str(root / 'cpuset' / 'limited')
     assert cpu_set.usage_level == str(root / 'cpuacct' / 'limited')
@@ -1585,8 +1696,8 @@ def test_no_cgroups() -> None:
     assert cgroup.read_cpu() == cgroup.RawCpu(
         quota=None, cpu_set=None, unreadable_file=None, unconvertible_level=None, unlocated_file=None
     )
-    assert cgroup.read_cpu_quota(cgroup.locate_controllers()) is None
-    assert cgroup.read_cpu_set_size(cgroup.locate_controllers()) is None
+    assert cgroup.read_cpu_quota(cgroup.locate_controllers()) == (None, None)
+    assert cgroup.read_cpu_set_size(cgroup.locate_controllers()) == (None, None)
     assert cgroup.read_cpu_usage() is None
 
 
@@ -1652,12 +1763,11 @@ def test_read_cpu_quota_tightest_level(fake_cgroup: Callable[..., Path]) -> None
         },
     )
 
+    quota, unreadable_file = cgroup.read_cpu_quota(cgroup.locate_controllers())
+
     # The quota binds on the pod, so a rate has to be measured there rather than in the container.
-    assert cgroup.read_cpu_quota(cgroup.locate_controllers()) == cgroup.RawCpuQuota(
-        cores=1.5,
-        limit_level=str(root / 'pod'),
-        usage_level=str(root / 'pod'),
-    )
+    assert quota == cgroup.RawCpuQuota(cores=1.5, limit_level=str(root / 'pod'), usage_level=str(root / 'pod'))
+    assert unreadable_file is None
 
 
 def test_read_cpu_quota_on_the_own_group(fake_cgroup: Callable[..., Path]) -> None:
@@ -1673,11 +1783,14 @@ def test_read_cpu_quota_on_the_own_group(fake_cgroup: Callable[..., Path]) -> No
         },
     )
 
-    assert cgroup.read_cpu_quota(cgroup.locate_controllers()) == cgroup.RawCpuQuota(
+    quota, unreadable_file = cgroup.read_cpu_quota(cgroup.locate_controllers())
+
+    assert quota == cgroup.RawCpuQuota(
         cores=1.5,
         limit_level=str(root / 'pod' / 'container'),
         usage_level=str(root / 'pod' / 'container'),
     )
+    assert unreadable_file is None
 
 
 def test_read_cpu_usage_at_a_named_level(fake_cgroup: Callable[..., Path]) -> None:
@@ -1724,8 +1837,9 @@ def test_read_cpu_set_size_reads_the_closest_level(fake_cgroup: Callable[..., Pa
         },
     )
 
-    cpu_set = cgroup.read_cpu_set_size(cgroup.locate_controllers())
+    cpu_set, unreadable_file = cgroup.read_cpu_set_size(cgroup.locate_controllers())
 
+    assert unreadable_file is None
     assert cpu_set is not None
     assert cpu_set.cores == 2
     assert cpu_set.usage_level == str(root / 'pod' / 'container')
@@ -1831,6 +1945,32 @@ def test_read_cpu_quota_v1_zero_quota(fake_cgroup: Callable[..., Path]) -> None:
     assert cgroup.read_cpu().unreadable_file == f'{root / "cpu,cpuacct" / "cpu.cfs_quota_us"} (holds zero)'
 
 
+def test_read_cpu_quota_v1_zero_quota_beside_an_unreadable_period(fake_cgroup: Callable[..., Path]) -> None:
+    """Names the quota file for a quota of zero, whatever its period file holds."""
+    root = fake_cgroup(
+        mountinfo=V1_MOUNTINFO,
+        self_cgroup=V1_SELF_CGROUP.format(path='/'),
+        files={'cpu,cpuacct/cpu.cfs_quota_us': '0\n', 'cpu,cpuacct/cpuacct.usage': '0\n'},
+    )
+    (root / 'cpu,cpuacct' / 'cpu.cfs_period_us').mkdir()
+
+    assert cgroup.read_cpu().unreadable_file == f'{root / "cpu,cpuacct" / "cpu.cfs_quota_us"} (holds zero)'
+
+
+def test_read_cpu_quota_v1_unlimited_beside_an_unreadable_period(fake_cgroup: Callable[..., Path]) -> None:
+    """Names no file where a cgroup v1 level sets no quota, whatever its period file holds."""
+    root = fake_cgroup(
+        mountinfo=V1_MOUNTINFO,
+        self_cgroup=V1_SELF_CGROUP.format(path='/'),
+        files={'cpu,cpuacct/cpu.cfs_quota_us': '-1\n', 'cpu,cpuacct/cpuacct.usage': '0\n'},
+    )
+    (root / 'cpu,cpuacct' / 'cpu.cfs_period_us').mkdir()
+
+    assert cgroup.read_cpu() == cgroup.RawCpu(
+        quota=None, cpu_set=None, unreadable_file=None, unconvertible_level=None, unlocated_file=None
+    )
+
+
 def test_read_hierarchies_first_v1_mount_wins(fake_cgroup: Callable[..., Path]) -> None:
     """Keeps the first mount of a cgroup v1 controller, because mounts are listed in creation order."""
     mountinfo = (
@@ -1921,8 +2061,9 @@ def test_read_cpu_quota_across_split_hierarchies(fake_cgroup: Callable[..., Path
         },
     )
 
-    quota = cgroup.read_cpu_quota(cgroup.locate_controllers())
+    quota, unreadable_file = cgroup.read_cpu_quota(cgroup.locate_controllers())
 
+    assert unreadable_file is None
     assert quota is not None
     assert quota.cores == 0.5
     assert quota.limit_level == str(root / 'cpu' / 'slice')
@@ -1944,8 +2085,9 @@ def test_read_cpu_quota_without_accounting(fake_cgroup: Callable[..., Path]) -> 
         },
     )
 
-    quota = cgroup.read_cpu_quota(cgroup.locate_controllers())
+    quota, unreadable_file = cgroup.read_cpu_quota(cgroup.locate_controllers())
 
+    assert unreadable_file is None
     assert quota is not None
     assert quota.cores == 0.5
     assert quota.usage_level is None
@@ -1983,13 +2125,14 @@ def test_read_cpu_quota_appearing_after_discovery(fake_cgroup: Callable[..., Pat
         },
     )
 
-    assert cgroup.read_cpu_quota(cgroup.locate_controllers()) is None
+    assert cgroup.read_cpu_quota(cgroup.locate_controllers()) == (None, None)
 
     # The scope of this process is given a quota of its own, below where the chain would have been cut.
     (root / 'slice' / 'own' / 'cpu.max').write_text('50000 100000\n')
 
-    quota = cgroup.read_cpu_quota(cgroup.locate_controllers())
+    quota, unreadable_file = cgroup.read_cpu_quota(cgroup.locate_controllers())
 
+    assert unreadable_file is None
     assert quota is not None
     assert quota.cores == 0.5
     assert quota.limit_level == str(root / 'slice' / 'own')
@@ -2334,6 +2477,33 @@ def test_read_memory_negative_key_beside_a_positive_one(fake_cgroup: Callable[..
     )
 
 
+def test_read_memory_no_readable_limit(fake_cgroup: Callable[..., Path]) -> None:
+    """Reports no limit where none can be read, and names the closest file that cannot."""
+    root = fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/pod/container'),
+        files={
+            'pod/container/memory.max': 'not a number\n',
+            'pod/container/memory.current': '100\n',
+            'pod/container/memory.stat': 'inactive_file 0\n',
+            'pod/memory.current': '100\n',
+            'pod/memory.stat': 'inactive_file 0\n',
+        },
+    )
+    (root / 'pod' / 'memory.max').mkdir()
+
+    assert cgroup.read_memory() == cgroup.RawMemory(
+        limit=None,
+        used=None,
+        available=None,
+        unflushed_cache=None,
+        limit_level=None,
+        unreadable_file=f'{root / "pod" / "container" / "memory.max"} (holds no number)',
+        usage_unreadable_file=None,
+        unlocated_file=None,
+    )
+
+
 @pytest.mark.parametrize(
     ('files', 'name', 'reason'),
     [
@@ -2366,6 +2536,34 @@ def test_read_memory_names_why_a_usage_cannot_be_read(
     )
 
     assert cgroup.read_memory().usage_unreadable_file == f'{root / "pod" / name} ({reason})'
+
+
+@pytest.mark.parametrize(
+    ('files', 'name'),
+    [
+        pytest.param({'pod/memory.stat': 'inactive_file 0\n'}, 'memory.current', id='no usage file'),
+        pytest.param({'pod/memory.current': '100\n'}, 'memory.stat', id='no stat file'),
+    ],
+)
+def test_read_memory_names_an_absent_usage_file_out_of_descriptors(
+    fake_cgroup: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    files: dict[str, str],
+    name: str,
+) -> None:
+    """Names an absent usage file as absent where opening it fails for want of file descriptors."""
+    root = fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/pod'),
+        files={
+            'memory.current': '0\n',
+            'pod/memory.max': '1000\n',
+            **files,
+        },
+    )
+    fail_to_read(monkeypatch, root / 'pod' / name, emfile(), times=None)
+
+    assert cgroup.read_memory().usage_unreadable_file == f'{root / "pod" / name} (absent)'
 
 
 def test_read_memory_names_the_closest_silent_usage(fake_cgroup: Callable[..., Path]) -> None:
@@ -2401,6 +2599,112 @@ def test_read_cpu_quota_names_the_closest_unreadable_file(fake_cgroup: Callable[
     )
 
     expected = f'{root / "pod" / "container" / "cpu.max"} (holds no quota and period)'
+    assert cgroup.read_cpu().unreadable_file == expected
+
+
+def test_read_cpu_keeps_the_set_beside_an_unreadable_quota(fake_cgroup: Callable[..., Path]) -> None:
+    """Reports the set where the quota beside it cannot be read, and names the quota file."""
+    root = fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/'),
+        files={'cpu.max': 'nonsense\n', 'cpuset.cpus.effective': '0-1\n', 'cpu.stat': 'usage_usec 0\n'},
+    )
+
+    assert cgroup.read_cpu() == cgroup.RawCpu(
+        quota=None,
+        cpu_set=cgroup.RawCpuSet(cores=2, limit_level=str(root), usage_level=str(root)),
+        unreadable_file=f'{root / "cpu.max"} (holds no quota and period)',
+        unconvertible_level=None,
+        unlocated_file=None,
+    )
+
+
+def test_read_cpu_keeps_the_quota_beside_an_unreadable_set(fake_cgroup: Callable[..., Path]) -> None:
+    """Reports the quota where the set beside it cannot be read, and names the set file."""
+    root = fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/'),
+        files={'cpu.max': '50000 100000\n', 'cpuset.cpus.effective': '0-1,nonsense\n', 'cpu.stat': 'usage_usec 0\n'},
+    )
+
+    assert cgroup.read_cpu() == cgroup.RawCpu(
+        quota=cgroup.RawCpuQuota(cores=0.5, limit_level=str(root), usage_level=str(root)),
+        cpu_set=None,
+        unreadable_file=f'{root / "cpuset.cpus.effective"} (holds no list of cores)',
+        unconvertible_level=None,
+        unlocated_file=None,
+    )
+
+
+def test_read_cpu_set_size_does_not_walk_up_past_an_unreadable_set(fake_cgroup: Callable[..., Path]) -> None:
+    """Reports no set where the closest one cannot be read, rather than the set of an ancestor."""
+    root = fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/pod/container'),
+        files={
+            'pod/container/cpu.stat': 'usage_usec 0\n',
+            'pod/cpuset.cpus.effective': '0-3\n',
+            'pod/cpu.stat': 'usage_usec 0\n',
+        },
+    )
+    # A cgroup v2 partition takes its cores out of the effective set of its parent, so the pod's set need not
+    # contain the container's.
+    (root / 'pod' / 'container' / 'cpuset.cpus.effective').mkdir()
+
+    assert cgroup.read_cpu() == cgroup.RawCpu(
+        quota=None,
+        cpu_set=None,
+        unreadable_file=f'{root / "pod" / "container" / "cpuset.cpus.effective"} ({OPENING_A_DIRECTORY})',
+        unconvertible_level=None,
+        unlocated_file=None,
+    )
+
+
+@pytest.mark.parametrize(
+    ('configured', 'expected'),
+    [
+        pytest.param('0-1\n', 2, id='a configured set'),
+        # An empty file spells an inherited set. The set of the parent is no stand-in for it.
+        pytest.param('\n', None, id='an inherited set'),
+        pytest.param('0-1,nonsense\n', None, id='a configured set that cannot be read either'),
+    ],
+)
+def test_read_cpu_set_size_past_an_unreadable_effective_set_under_v1(
+    fake_cgroup: Callable[..., Path],
+    configured: str,
+    expected: int | None,
+) -> None:
+    """Reads the configured set of the same level where the effective one cannot be read, and names the latter."""
+    root = fake_cgroup(
+        mountinfo=V1_MOUNTINFO,
+        self_cgroup=V1_SELF_CGROUP.format(path='/child'),
+        files={'cpuset/cpuset.cpus': '0-3\n', 'cpuset/child/cpuset.cpus': configured},
+    )
+    # A directory in place of the file, so the file is there and the read fails.
+    effective = root / 'cpuset' / 'child' / 'cpuset.effective_cpus'
+    effective.mkdir()
+
+    raw = cgroup.read_cpu()
+
+    assert raw.unreadable_file == f'{effective} ({OPENING_A_DIRECTORY})'
+    assert (raw.cpu_set.cores if raw.cpu_set is not None else None) == expected
+
+
+def test_read_cpu_names_an_unreadable_quota_over_a_closer_set(fake_cgroup: Callable[..., Path]) -> None:
+    """Names the unreadable quota of the parent over the unreadable set of the own cgroup."""
+    root = fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/pod/container'),
+        files={
+            'pod/container/cpuset.cpus.effective': '0-1,nonsense\n',
+            'pod/container/cpu.stat': 'usage_usec 0\n',
+            'pod/cpu.max': 'nonsense\n',
+            'pod/cpu.stat': 'usage_usec 0\n',
+        },
+    )
+
+    # The set file is closer, and the quota file is named all the same.
+    expected = f'{root / "pod" / "cpu.max"} (holds no quota and period)'
     assert cgroup.read_cpu().unreadable_file == expected
 
 
