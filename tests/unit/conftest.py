@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
@@ -8,7 +9,6 @@ from proclimits import _cgroup
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
-    from pathlib import Path
 
 V2_MOUNTINFO = '25 30 0:22 / {root} rw,nosuid,nodev,noexec,relatime shared:4 - cgroup2 cgroup2 rw,nsdelegate'
 """A single unified hierarchy exposed from its top, which is what a container runtime sets up."""
@@ -51,6 +51,22 @@ V1_SELF_CGROUP = '4:cpuset:{path}\n3:cpu,cpuacct:{path}\n2:memory:{path}\n1:name
 
 HYBRID_SELF_CGROUP = '0::/system.slice/docker.service\n3:cpu,cpuacct:/docker/abc\n2:memory:/docker/abc\n'
 """The two interfaces name different cgroups for the same process, which is what makes the layout dangerous."""
+
+
+def fail_to_read(monkeypatch: pytest.MonkeyPatch, failing: Path, error: OSError | ValueError, *, times: int) -> None:
+    """Make reading one file raise `error` the first `times` times, and read it as usual after that.
+
+    The error names no file, as one raised by a read after the file was opened does not.
+    """
+    read_text = Path.read_text
+    failures = [error] * times
+
+    def read_or_fail(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+        if path == failing and failures:
+            raise failures.pop()
+        return read_text(path, encoding=encoding, errors=errors)
+
+    monkeypatch.setattr(Path, 'read_text', read_or_fail)
 
 
 @pytest.fixture(autouse=True)

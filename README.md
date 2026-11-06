@@ -8,7 +8,7 @@ Inside a container the usual answers describe the machine, not the process. `psu
 
 Reading the cgroup files directly is not enough either. The limit that applies is rarely written where the process is, and a cgroup that restricts nothing does not say so by leaving its limit file empty. A consumer that reads one file and takes it at face value believes it has 8 EB of memory.
 
-This package handles both, and reports only what actually restricts the process. `None` means nothing visible to the process restricts it - the machine is then the honest answer, and `get_machine_cpu_count()` and `get_machine_memory_bytes()` below give it.
+This package handles both, and reports only what actually restricts the process. `None` means nothing visible to the process restricts it, or a limit could not be read or used. `describe().notices` says which. The machine is then what is left to size from, and `get_machine_cpu_count()` and `get_machine_memory_bytes()` below give it.
 
 Off Linux and Windows every limit reads as `None`. macOS still reports the memory and the CPU cores of the machine. On other platforms the machine facts can read as `None`. Some examples below pair this package with `psutil`, which it does not require - `psutil` answers what the machine is using, which is not a question about limits.
 
@@ -193,6 +193,8 @@ A limit of `None` with no notice about it means nothing went wrong: the mechanis
 | `CPU_USAGE_SCOPE_MISMATCH` | the level the CPU limit applies to counts no CPU time, so no rate can be measured | cgroup v1 with `cpu` and `cpuacct` on separate mounts, where the level holding the quota has no counterpart under the accounting one |
 | `MEMORY_METRICS_UNAVAILABLE` | no mechanism here is present to carry a memory limit | a host with no cgroup filesystem mounted, or a platform this package has no backend for |
 | `CPU_METRICS_UNAVAILABLE` | no mechanism here is present to carry a CPU limit | the same |
+| `MEMORY_METRICS_UNREADABLE` | where a memory limit would be read from cannot be located, because a `/proc` file cannot be read; the next reading tries again | a `/proc` file that could not be read while no discovery is kept: before the first one succeeded, or after `clear_cache()` or a fork |
+| `CPU_METRICS_UNREADABLE` | the same for a CPU limit | the same |
 | `MEMORY_ANCESTORS_HIDDEN` | only part of the memory hierarchy is visible, so a limit above it is enforced but unreadable | a container given a subtree as its whole `/sys/fs/cgroup` |
 | `CPU_ANCESTORS_HIDDEN` | only part of a CPU hierarchy is visible | the same |
 | `MEMORY_LIMIT_UNREADABLE` | a level holds a memory limit that says nothing usable, so what it enforces is unknown | a hand-built or mocked cgroup tree; no kernel writes such a value |

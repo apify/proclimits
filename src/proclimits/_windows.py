@@ -293,6 +293,7 @@ _NO_MEMORY = RawMemory(
     limit_level=None,
     unreadable_level=None,
     usage_unreadable_level=None,
+    unlocated_file=None,
 )
 """What is reported where no job limits the memory."""
 
@@ -304,6 +305,7 @@ _UNREADABLE_MEMORY = RawMemory(
     limit_level=None,
     unreadable_level=_LEVEL,
     usage_unreadable_level=None,
+    unlocated_file=None,
 )
 """What is reported where this process is in a job that will not say what it enforces."""
 
@@ -337,6 +339,7 @@ def read_memory() -> RawMemory:
             limit_level=_LEVEL,
             unreadable_level=None,
             usage_unreadable_level=None,
+            unlocated_file=None,
         )
 
     if job_limit is None:
@@ -358,6 +361,7 @@ def read_cpu() -> RawCpu:
             cpu_set=None,
             unreadable_level=None if error == _ERROR_NO_JOB else _LEVEL,
             unconvertible_level=None,
+            unlocated_file=None,
         )
 
     # One unreadable answer drops both restrictions, because the unread one may be the tighter. No machine
@@ -365,7 +369,7 @@ def read_cpu() -> RawCpu:
     # were measured to answer or fail together.
     control, _ = _query(_JOB_CPU_RATE_CONTROL, _RateControl)
     if control is None:
-        return RawCpu(quota=None, cpu_set=None, unreadable_level=_LEVEL, unconvertible_level=None)
+        return RawCpu(quota=None, cpu_set=None, unreadable_level=_LEVEL, unconvertible_level=None, unlocated_file=None)
 
     rate = _rate_cap(control)
     machine_cores = machine_cpu_count()
@@ -373,7 +377,7 @@ def read_cpu() -> RawCpu:
     if rate is not None and machine_cores is None:
         # A rate is a share of the machine, so without the size of the machine it says nothing about cores.
         # The affinity mask goes with it: the share that cannot be sized may be the tighter of the two.
-        return RawCpu(quota=None, cpu_set=None, unreadable_level=None, unconvertible_level=_LEVEL)
+        return RawCpu(quota=None, cpu_set=None, unreadable_level=None, unconvertible_level=_LEVEL, unlocated_file=None)
 
     quota = (
         RawCpuQuota(cores=rate * machine_cores, limit_level=_LEVEL, usage_level=_LEVEL)
@@ -391,11 +395,13 @@ def read_cpu() -> RawCpu:
         if allowed is None:
             # The job restricts the cores and will not say which, so what it allows is unknown rather than
             # unrestricted.
-            return RawCpu(quota=None, cpu_set=None, unreadable_level=_LEVEL, unconvertible_level=None)
+            return RawCpu(
+                quota=None, cpu_set=None, unreadable_level=_LEVEL, unconvertible_level=None, unlocated_file=None
+            )
 
         cpu_set = RawCpuSet(cores=allowed, limit_level=_LEVEL, usage_level=_LEVEL)
 
-    return RawCpu(quota=quota, cpu_set=cpu_set, unreadable_level=None, unconvertible_level=None)
+    return RawCpu(quota=quota, cpu_set=cpu_set, unreadable_level=None, unconvertible_level=None, unlocated_file=None)
 
 
 def read_cpu_usage(level: str | None = None) -> float | None:
@@ -430,7 +436,7 @@ def sources() -> Sources:
     """
     source = Source(interface=Interface.WINDOWS_JOB_OBJECT, levels=(_LEVEL,) if _in_job() else ())
 
-    return Sources(memory=source, cpu_quota=source, cpu_set=source, cpu_usage=source)
+    return Sources(memory=source, cpu_quota=source, cpu_set=source, cpu_usage=source, unlocated_file=None)
 
 
 def mechanism_notices() -> tuple[Notice, ...]:
@@ -574,6 +580,7 @@ def _job_memory(limit: int) -> RawMemory:
         # Nothing charged takes two unrelated APIs refusing at once, and has never been seen on a machine.
         # A job-wide limit does have a usage figure, so this is a guard rather than a path.
         usage_unreadable_level=_LEVEL if charged is None else None,
+        unlocated_file=None,
     )
 
 
