@@ -16,10 +16,12 @@ from .harness import (
     check_invariants,
     parse,
     pull_image,
+    require_docker,
 )
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from pathlib import Path
 
     from .harness import Reading
 
@@ -47,9 +49,49 @@ def kubectl(*args: str, check: bool = True) -> str:
     return result.stdout
 
 
+def load_image(archive: Path) -> None:
+    """Load the probe image into the node of the test cluster."""
+    # The node is a container of this daemon and shares its platform. The daemon spells it the way
+    # `--platform` expects, such as `linux/amd64`.
+    server = subprocess.run(
+        ['docker', 'version', '--format', '{{.Server.Os}}/{{.Server.Arch}}'],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    # An empty `--platform` saves every platform. kind cannot load that archive.
+    if server.returncode != 0:
+        pytest.fail(f'the docker daemon did not name its platform: {server.stderr.strip()[-300:]}')
+
+    # Docker 29 keeps images in containerd by default. From there `kind load docker-image` fails on a multi-platform
+    # image: kubernetes-sigs/kind#3795. The kind docs load an archive of one platform instead.
+    saved = subprocess.run(
+        ['docker', 'image', 'save', '--platform', server.stdout.strip(), '--output', str(archive), IMAGE],
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT_SECONDS,
+        check=False,
+    )
+    if saved.returncode != 0:
+        pytest.fail(f'{IMAGE} could not be exported: {saved.stderr.strip()[-300:]}')
+
+    loaded = subprocess.run(
+        ['kind', 'load', 'image-archive', str(archive), '--name', CLUSTER],
+        capture_output=True,
+        text=True,
+        timeout=900,
+        check=False,
+    )
+    if loaded.returncode != 0:
+        pytest.fail(f'{IMAGE} could not be loaded into the cluster: {loaded.stderr.strip()[-300:]}')
+
+
 @pytest.fixture(scope='session')
-def _cluster() -> Iterator[None]:
+def _cluster(tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
     """Bring up a kind cluster carrying the probe image where none is running, and take that one down afterwards."""
+    require_docker()
+
     existing = subprocess.run(
         ['kind', 'get', 'clusters'],
         capture_output=True,
@@ -57,44 +99,50 @@ def _cluster() -> Iterator[None]:
         timeout=TIMEOUT_SECONDS,
         check=False,
     )
+    # A failed listing reads as no cluster. The teardown would then delete one this run did not create.
+    if existing.returncode != 0:
+        pytest.fail(f'kind could not list the clusters: {existing.stderr.strip()[-300:]}')
+
     pre_existing = CLUSTER in existing.stdout.split()
 
-    if not pre_existing:
-        created = subprocess.run(
-            ['kind', 'create', 'cluster', '--name', CLUSTER, '--wait', '120s'],
-            capture_output=True,
-            text=True,
-            timeout=900,
-            check=False,
-        )
-        if created.returncode != 0:
-            pytest.fail(f'the cluster could not be created: {created.stderr.strip()[-300:]}')
+    # The teardown also runs when the setup below fails. A cluster left up would count as pre-existing on the
+    # next run. That run would never delete it. The creation is part of the setup: a timeout or Ctrl-C kills
+    # kind before it can remove the nodes it started.
+    try:
+        if not pre_existing:
+            created = subprocess.run(
+                ['kind', 'create', 'cluster', '--name', CLUSTER, '--wait', '120s'],
+                capture_output=True,
+                text=True,
+                timeout=900,
+                check=False,
+            )
+            if created.returncode != 0:
+                pytest.fail(f'the cluster could not be created: {created.stderr.strip()[-300:]}')
 
-    pull_image(IMAGE)
-    subprocess.run(
-        ['kind', 'load', 'docker-image', IMAGE, '--name', CLUSTER],
-        capture_output=True,
-        timeout=900,
-        check=False,
-    )
+        pull_image(IMAGE)
+        load_image(tmp_path_factory.mktemp('kind') / 'image.tar')
 
-    # The package and the probe travel as config maps, so no image has to be built. The files go in one by
-    # one, so only the Python sources travel.
-    sources = sorted((SRC_DIR / 'proclimits').glob('*.py'))
-    kubectl('delete', 'configmap', SRC_MAP, PROBE_MAP, '--ignore-not-found')
-    kubectl('create', 'configmap', SRC_MAP, *[f'--from-file={path}' for path in sources])
-    kubectl('create', 'configmap', PROBE_MAP, f'--from-file={PROBE}')
+        # The package and the probe travel as config maps, so no image has to be built. The files go in one by
+        # one, so only the Python sources travel.
+        sources = sorted((SRC_DIR / 'proclimits').glob('*.py'))
+        kubectl('delete', 'configmap', SRC_MAP, PROBE_MAP, '--ignore-not-found')
+        kubectl('create', 'configmap', SRC_MAP, *[f'--from-file={path}' for path in sources])
+        kubectl('create', 'configmap', PROBE_MAP, f'--from-file={PROBE}')
 
-    yield
-
-    kubectl('delete', 'configmap', SRC_MAP, PROBE_MAP, '--ignore-not-found', check=False)
-    if not pre_existing:
-        subprocess.run(
-            ['kind', 'delete', 'cluster', '--name', CLUSTER],
-            capture_output=True,
-            timeout=300,
-            check=False,
-        )
+        yield
+    finally:
+        if pre_existing:
+            kubectl('delete', 'configmap', SRC_MAP, PROBE_MAP, '--ignore-not-found', check=False)
+        else:
+            # The cluster takes its config maps with it. This path needs no kubectl. A missing kubectl may be what
+            # failed.
+            subprocess.run(
+                ['kind', 'delete', 'cluster', '--name', CLUSTER],
+                capture_output=True,
+                timeout=300,
+                check=False,
+            )
 
 
 def manifest(resources: dict[str, Any]) -> str:
