@@ -540,10 +540,33 @@ def test_candidate_dirs(
         pytest.param(
             V2_MOUNTINFO,
             V2_SELF_CGROUP.format(path='/'),
-            # `memory.high` throttles reclaim instead of triggering an out-of-memory kill, so it is not a limit.
             {'memory.high': '536870912\n', 'memory.current': '1000\n', 'memory.stat': 'inactive_file 400\n'},
-            None,
-            id='memory.high without memory.max is not a limit',
+            536870912,
+            id='v2 memory.high alone',
+        ),
+        pytest.param(
+            V2_MOUNTINFO,
+            V2_SELF_CGROUP.format(path='/'),
+            {
+                'memory.max': '1073741824\n',
+                'memory.high': '536870912\n',
+                'memory.current': '1000\n',
+                'memory.stat': 'inactive_file 400\n',
+            },
+            536870912,
+            id='v2 memory.high below memory.max',
+        ),
+        pytest.param(
+            V2_MOUNTINFO,
+            V2_SELF_CGROUP.format(path='/'),
+            {
+                'memory.max': '536870912\n',
+                'memory.high': '1073741824\n',
+                'memory.current': '1000\n',
+                'memory.stat': 'inactive_file 400\n',
+            },
+            536870912,
+            id='v2 memory.high above memory.max',
         ),
         pytest.param(
             V2_MOUNTINFO,
@@ -1171,8 +1194,15 @@ def test_cpu_usage_dir_rejects_a_group_of_the_same_name(fake_cgroup: Callable[..
     assert quota.usage_level is None
 
 
-def test_read_memory_unreadable_limit(fake_cgroup: Callable[..., Path]) -> None:
-    """Names the level whose limit cannot be read, instead of answering with a looser ancestor."""
+@pytest.mark.parametrize(
+    ('unreadable', 'readable'),
+    [
+        pytest.param('memory.max', 'memory.high', id='memory.max'),
+        pytest.param('memory.high', 'memory.max', id='memory.high'),
+    ],
+)
+def test_read_memory_unreadable_limit(fake_cgroup: Callable[..., Path], unreadable: str, readable: str) -> None:
+    """Names the level whose limit cannot be read, instead of answering with a limit that may be looser."""
     root = fake_cgroup(
         mountinfo=V2_MOUNTINFO,
         self_cgroup=V2_SELF_CGROUP.format(path='/pod/container'),
@@ -1180,7 +1210,8 @@ def test_read_memory_unreadable_limit(fake_cgroup: Callable[..., Path]) -> None:
             'pod/memory.max': '10737418240\n',
             'pod/memory.current': '100\n',
             'pod/memory.stat': 'inactive_file 0\n',
-            'pod/container/memory.max': 'not a number\n',
+            f'pod/container/{unreadable}': 'not a number\n',
+            f'pod/container/{readable}': '536870912\n',
             'pod/container/memory.current': '100\n',
             'pod/container/memory.stat': 'inactive_file 0\n',
         },
@@ -1245,7 +1276,14 @@ def test_read_memory_limit_file_cannot_be_opened(fake_cgroup: Callable[..., Path
     assert cgroup.read_memory().unreadable_level == str(root / 'pod' / 'container')
 
 
-def test_read_memory_negative_limit(fake_cgroup: Callable[..., Path]) -> None:
+@pytest.mark.parametrize(
+    ('negative', 'readable'),
+    [
+        pytest.param('memory.max', 'memory.high', id='memory.max'),
+        pytest.param('memory.high', 'memory.max', id='memory.high'),
+    ],
+)
+def test_read_memory_negative_limit(fake_cgroup: Callable[..., Path], negative: str, readable: str) -> None:
     """Names a level whose limit is a negative number of bytes, which is no limit and no absence either."""
     root = fake_cgroup(
         mountinfo=V2_MOUNTINFO,
@@ -1254,7 +1292,8 @@ def test_read_memory_negative_limit(fake_cgroup: Callable[..., Path]) -> None:
             'pod/memory.max': '10737418240\n',
             'pod/memory.current': '100\n',
             'pod/memory.stat': 'inactive_file 0\n',
-            'pod/container/memory.max': '-5\n',
+            f'pod/container/{negative}': '-5\n',
+            f'pod/container/{readable}': '536870912\n',
         },
     )
 

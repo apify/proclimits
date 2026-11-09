@@ -44,9 +44,10 @@ def test_python_versions(python_version: str) -> None:
 
 
 @pytest.mark.unified
-def test_memory_limit(systemd_scope: Callable[..., list[str]]) -> None:
+@pytest.mark.parametrize('limit_property', ['MemoryMax', 'MemoryHigh'])
+def test_memory_limit(systemd_scope: Callable[..., list[str]], limit_property: str) -> None:
     """Reads a memory limit set on the scope this process runs in."""
-    reading = probe_here(systemd_scope(f'MemoryMax={MEMORY_LIMIT}'))
+    reading = probe_here(systemd_scope(f'{limit_property}={MEMORY_LIMIT}'))
 
     check_invariants(reading)
     assert reading.memory_limit == MEMORY_LIMIT

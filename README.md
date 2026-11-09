@@ -20,11 +20,13 @@ In both mechanisms a limit sits on a level above the process: on Linux any cgrou
 
 **A limit that restricts nothing is dropped rather than reported.** An unrestricted group still holds a number that looks like a limit: cgroup v1 spells "no limit" as a sentinel near 2\*\*63, a CPU quota can exceed the cores of the machine, and a CPU set can cover every core of it. Every reading is therefore compared against the machine, and one that turns out to restrict nothing is dropped. The answer is then `None`, and `describe().notices` says which reading was dropped and why.
 
-**A limit this process cannot see is not reported.** A container can be given a subtree as its whole cgroup filesystem, a [cgroup namespace](https://man7.org/linux/man-pages/man7/cgroup_namespaces.7.html) can hide the levels above the process, and a Windows job can [sit inside another](https://learn.microsoft.com/en-us/windows/win32/procthread/nested-jobs). A limit there is still enforced, and nothing here can read it. The first is reported as a `*_ANCESTORS_HIDDEN` notice. The other two leave nothing to detect, so the absence of that notice is not a guarantee.
+**A limit this process cannot see is not reported.** A container can be given a subtree as its whole cgroup filesystem, a [cgroup namespace](https://man7.org/linux/man-pages/man7/cgroup_namespaces.7.html) can hide the levels above the process, and a Windows job can [sit inside another](https://learn.microsoft.com/en-us/windows/win32/procthread/nested-jobs). A limit there is still enforced, and nothing here can read it. The first is reported as a `*_ANCESTORS_HIDDEN` notice. The other two raise no notice, so the absence of that notice is not a guarantee.
 
 ### On Linux
 
 A process does not sit in one cgroup. It sits in a chain of them: its own group, the group above that, and so on up to the root. A limit on [any level of that chain](https://docs.kernel.org/admin-guide/cgroup-v2.html) restricts the process, and the kernel enforces whichever level is tightest. That level is often not the group of the process. Under Kubernetes the limit usually sits on the pod cgroup rather than the container's, and the `kubepods` slice above them holds the memory the node is allowed to hand out at all. Under systemd a scope carries no CPU quota of its own while the slice above it does. This package therefore walks the whole chain.
+
+On cgroup v2 a level can hold two memory limits, `memory.max` and [`memory.high`](https://docs.kernel.org/admin-guide/cgroup-v2.html#memory-interface-files). The tighter of the two is the limit of that level.
 
 ### On Windows
 
@@ -142,9 +144,9 @@ Do not divide `get_cpu_usage()` by `get_cpu_limit()`. The counter is read at the
 | `used` | the memory charged against that limit, as the mechanism counts it |
 | `used_ratio` | `used / limit` |
 
-`available` is the number to size a budget from, and it is read from the mechanism rather than worked out from the other two: a kill follows from a distance, not from a ratio. On Linux it is the smallest distance to any limit on the chain, and `used` is whatever keeps that distance exact against the tightest of them - so it need not match the content of any file. On Windows it is what the job may still commit, which is the distance to the job's own limit. `used_ratio` follows from the pair, and is the approximate one.
+`available` is the number to size a budget from, and it is read from the mechanism rather than worked out from the other two: the kernel acts on a distance, not on a ratio. On Linux it is the smallest distance to any limit on the chain, and `used` is whatever keeps that distance exact against the tightest of them - so it need not match the content of any file. On Windows it is what the job may still commit, which is the distance to the job's own limit. `used_ratio` follows from the pair, and is the approximate one.
 
-On Linux the distance counts as free the inactive file cache that is not waiting to reach the disk. The kernel has to reclaim that cache before it hands the memory out. So the number sizes a budget and does not promise the next allocation. Right after writing it reads lower. It stays lower until the data reaches the disk. On default kernel settings that can be more than half a minute after the writing stopped.
+On Linux the distance counts as free the inactive file cache that is not waiting to reach the disk. The kernel has to reclaim that cache to make room. So the number sizes a budget and does not promise the next allocation. Right after writing it reads lower. It stays lower until the data reaches the disk. On default kernel settings that can be more than half a minute after the writing stopped.
 
 It answers for the limit, not for the machine. A host that is itself running out of memory can refuse an allocation that every number here says there is room for. A cgroup limit does not see the host swapping, and a job's commit headroom does not fall when the machine's does.
 
@@ -177,7 +179,7 @@ Process affinity stays out too. `taskset` on Linux, and `SetProcessAffinityMask`
 
 `Source.levels` is the whole chain that was searched, not the levels that answered. Most levels on a chain hold no limit, which is normal - the chain is searched once and kept, because a limit can be written to any of them later. A job object is one level, named `job`. The chain is empty where the mechanism is present with nothing to search: a hierarchy binding no such controller, or a process in no job. The level a reading did come from is `memory_limit_level` or `cpu_limit_level`.
 
-A limit of `None` with no notice about it means nothing went wrong: the mechanism was there, and no level held a limit. Only hard limits count - [`memory.high`](https://docs.kernel.org/admin-guide/cgroup-v2.html) throttles reclaim rather than killing, so a cgroup can sit above it indefinitely and nothing here reports that.
+A limit of `None` with no notice about it means nothing went wrong: the mechanism was there, and no level this process can see held a limit.
 
 `Source.interface` is an `Interface` member - `CGROUP_V2`, `CGROUP_V1` or `WINDOWS_JOB_OBJECT` - and a notice carries a `NoticeCode`. Branch on those rather than on the strings they print as:
 

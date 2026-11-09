@@ -42,11 +42,12 @@ _CONVENTIONAL_MOUNT_POINT = Path('/sys/fs/cgroup')
 class _FileNames:
     """What one cgroup interface calls the files this module reads.
 
-    The two interfaces differ in the names far more than in the meaning, so the names are tabled here.
+    The two interfaces name the files differently. cgroup v2 also has a second file read as a memory limit. Both
+    differences are tabled here.
     """
 
-    memory_limit: str
-    """Holds the hard memory limit."""
+    memory_limits: tuple[str, ...]
+    """The files holding the memory limits of one level."""
 
     memory_usage: str
     """Holds the memory charged to the cgroup, page cache included."""
@@ -74,7 +75,7 @@ class _FileNames:
 
 
 _V2 = _FileNames(
-    memory_limit='memory.max',
+    memory_limits=('memory.max', 'memory.high'),
     memory_usage='memory.current',
     memory_stat='memory.stat',
     inactive_file='inactive_file',
@@ -86,7 +87,7 @@ _V2 = _FileNames(
 )
 
 _V1 = _FileNames(
-    memory_limit='memory.limit_in_bytes',
+    memory_limits=('memory.limit_in_bytes',),
     memory_usage='memory.usage_in_bytes',
     memory_stat='memory.stat',
     inactive_file='total_inactive_file',
@@ -299,7 +300,7 @@ class _MemoryLevel:
     """One level of the chain that holds a memory limit."""
 
     limit: int
-    """The limit that level holds, in bytes."""
+    """The tightest limit that level holds, in bytes."""
 
     usage: _MemoryUsage | None
     """What that level is charged, or `None` when it cannot be read."""
@@ -320,10 +321,7 @@ class _MemoryLevel:
 
     @property
     def available(self) -> int | None:
-        """The room left under the limit, in bytes, clamped at zero. `None` when the usage cannot be read.
-
-        A level sits above its limit while the kernel reclaims. Nothing can be allocated there.
-        """
+        """The room left under the limit, in bytes, clamped at zero. `None` when the usage cannot be read."""
         return None if self.distance is None else max(self.distance, 0)
 
 
@@ -346,9 +344,9 @@ _NO_CPU = RawCpu(quota=None, cpu_set=None, unreadable_level=None, unconvertible_
 def read_memory() -> RawMemory:
     """Read the tightest memory limit along the chain, with a usage that keeps the distance to it.
 
-    An out-of-memory kill follows from how much memory can still be allocated, not from a ratio. The smallest
-    distance to a limit anywhere along the chain is therefore the quantity carried over, expressed against the
-    tightest limit so that a consumer sees one comparable pair.
+    The kernel acts on the distance to a limit, not on a ratio. The smallest distance to a limit anywhere
+    along the chain is therefore the quantity carried over, expressed against the tightest limit so that a
+    consumer sees one comparable pair.
 
     Where a `/proc` file keeps the controller from being located, nothing is read and `unlocated_file` names it.
     """
@@ -384,7 +382,7 @@ def read_memory() -> RawMemory:
 
     # Memory is charged up the whole chain. An ancestor counts what its other children use, so its distance can be
     # smaller than the tightest level's. An unknown distance may be the smallest, so it ranks first and no usage is
-    # reported. Skipping it would promise memory the kernel will not give.
+    # reported. Skipping it would promise memory past a limit.
     min_distance_level = min(levels, key=lambda level: float('-inf') if level.distance is None else level.distance)
 
     if min_distance_level.usage is None or min_distance_level.available is None:
@@ -422,11 +420,15 @@ def _read_memory_levels(controller: Controller) -> list[_MemoryLevel]:
     levels = []
 
     for directory in controller.dirs:
-        # Only the hard limit counts. `memory.high` throttles reclaim instead of killing, so a cgroup can sit
-        # above it indefinitely.
-        limit = _read_limit(directory / controller.names.memory_limit)
-        if limit is None:
+        # `mem_cgroup_wb_stats` in mm/memcontrol.c takes `min(memory.max, memory.high)` as the ceiling of each
+        # level when it works out the room left. The tighter of the two is the limit of the level here too.
+        limits = [
+            found for name in controller.names.memory_limits if (found := _read_limit(directory / name)) is not None
+        ]
+        if not limits:
             continue
+
+        limit = min(limits)
 
         # Zero is a limit, and the tightest one a cgroup can hold. A negative number of bytes is not a limit
         # at all, and no kernel writes one - so it is a file this module cannot use rather than an absent one.

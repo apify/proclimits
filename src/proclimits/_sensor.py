@@ -23,7 +23,7 @@ class MemoryBudget:
     """
 
     limit: int
-    """The tightest limit in bytes. Always below `describe().memory_limit_ceiling`.
+    """The tightest limit in bytes. Always below `describe().memory_limit_ceiling`. It can be 0.
 
     A Windows job limits commit, so that ceiling - and this limit with it - can stand above the memory of the
     machine. Taking the smaller of this and `machine_memory_bytes` there sizes from a limit that does not
@@ -61,6 +61,8 @@ class MemoryBudget:
 
         Of the limit, not of this process: where the limit belongs to a level above, everything else under
         that level is charged against it too.
+
+        A limit of 0 gives 1.0.
         """
         return self.used / self.limit if self.limit > 0 else 1.0
 
@@ -94,8 +96,8 @@ class Description:
     This is the diagnostic counterpart of `snapshot()`, and it carries the readings themselves, so that one
     dump answers what was reported as well as why.
 
-    A limit of `None` next to no notice about it means the mechanism was there and nothing limited this
-    process in a way that kills it. Only hard limits are read.
+    A limit of `None` next to no notice about it means the mechanism was there and no level this process can see
+    held a limit.
 
     The sources are located after the readings, so beside a `*_METRICS_UNREADABLE` notice they can show what a
     later lookup found.
@@ -581,7 +583,7 @@ def _evaluate_memory(ceiling: int | None) -> _MemoryEvaluation:
 def _reconcile(limit: int, used: int, available: int) -> MemoryBudget:
     """Bring three numbers a mechanism may have read separately into one pair a consumer can use."""
     # The memory in use first, so the distance below it is already a number that can be allocated. The room
-    # gives way rather than the usage: one left too high promises memory the kernel will refuse.
+    # gives way rather than the usage: one left too high promises memory past the limit.
     charged = min(max(used, 0), limit)
 
     return MemoryBudget(limit=limit, used=charged, available=min(max(available, 0), limit - charged))
@@ -813,8 +815,9 @@ def get_machine_memory_bytes() -> int | None:
     `get_memory_budget()` has the other half of the answer here. A limit is compared against
     `describe().memory_limit_ceiling` instead.
 
-    A runtime that virtualizes this number (lxcfs) makes it equal the limit, which is then reported as no
-    restriction.
+    A runtime that virtualizes this number (lxcfs) makes it equal the tightest `memory.max` on the chain, or
+    `memory.limit_in_bytes` under cgroup v1. That limit is then reported as no restriction. A tighter
+    `memory.high` is reported as the limit.
 
     Returns:
         The total memory, or `None` when it cannot be read.

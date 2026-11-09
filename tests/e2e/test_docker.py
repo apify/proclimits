@@ -123,6 +123,31 @@ def test_tighter_limit_inside_the_container() -> None:
     assert reading.memory_limit == TIGHTER_MEMORY_LIMIT
 
 
+@pytest.mark.unified
+def test_memory_high_inside_the_container() -> None:
+    """Takes `memory.high` as the limit where it is tighter than the `memory.max` of the container."""
+    # The layout of `test_tighter_limit_inside_the_container`, with the tighter limit written to `memory.high`.
+    setup = f"""
+    set -e
+    mkdir -p /sys/fs/cgroup/init /sys/fs/cgroup/inner
+    echo 0 > /sys/fs/cgroup/init/cgroup.procs
+    echo +memory > /sys/fs/cgroup/cgroup.subtree_control
+    echo {TIGHTER_MEMORY_LIMIT} > /sys/fs/cgroup/inner/memory.high
+    echo 0 > /sys/fs/cgroup/inner/cgroup.procs
+    exec {probe_command()}
+    """
+
+    reading = probe_in_container(
+        '--privileged',
+        '--memory',
+        str(MEMORY_LIMIT),
+        command=['sh', '-c', setup],
+    )
+
+    check_invariants(reading)
+    assert reading.memory_limit == TIGHTER_MEMORY_LIMIT
+
+
 @pytest.mark.parametrize('image', DISTRO_IMAGES)
 def test_distributions(image: str) -> None:
     """Reads the same limits on every distribution, whichever libc the image carries."""
