@@ -136,21 +136,30 @@ def test_read_memory_without_a_job(monkeypatch: pytest.MonkeyPatch) -> None:
     """Reports no limit, and no failure, where nothing put this process in a job."""
     monkeypatch.setattr(_windows, '_query', without_a_job())
 
-    assert _windows.read_memory() == _windows._NO_MEMORY
+    raw = _windows.read_memory()
+
+    assert raw == _windows._NO_MEMORY
+    # Equality with the constant does not pin the constant's own field. A job is not located through `/proc`.
+    assert raw.unlocated_file is None
 
 
 def test_read_memory_when_the_job_says_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
     """Calls a job that will not answer unreadable, rather than unlimited."""
     monkeypatch.setattr(_windows, '_query', answering())
 
-    assert _windows.read_memory().unreadable_level == 'job'
+    raw = _windows.read_memory()
+
+    assert (raw.unreadable_level, raw.unlocated_file) == ('job', None)
 
 
 def test_read_memory_without_a_memory_limit(monkeypatch: pytest.MonkeyPatch) -> None:
     """Reports nothing where the job answers and carries no memory limit."""
     monkeypatch.setattr(_windows, '_query', answering(_JOB_EXTENDED_LIMIT=extended_limits()))
 
-    assert _windows.read_memory() == _windows._NO_MEMORY
+    raw = _windows.read_memory()
+
+    assert raw == _windows._NO_MEMORY
+    assert raw.unlocated_file is None
 
 
 def test_read_memory_falls_back_to_the_distance(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -166,6 +175,7 @@ def test_read_memory_falls_back_to_the_distance(monkeypatch: pytest.MonkeyPatch)
     raw = _windows.read_memory()
 
     assert (raw.limit, raw.used, raw.available) == (512 * MIB, 12 * MIB, 500 * MIB)
+    assert raw.unlocated_file is None
 
 
 def test_read_memory_keeps_what_the_mechanism_answered(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -227,6 +237,7 @@ def test_read_memory_with_only_a_per_process_limit(monkeypatch: pytest.MonkeyPat
     assert raw.limit_level == 'job'
     # No call failed: a per-process limit is a shape the job pairs no usage figure with.
     assert raw.usage_unreadable_level is None
+    assert raw.unlocated_file is None
 
 
 def test_read_memory_prefers_a_tighter_per_process_limit(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -275,14 +286,16 @@ def test_read_cpu_without_a_job(monkeypatch: pytest.MonkeyPatch) -> None:
 
     raw = _windows.read_cpu()
 
-    assert (raw.quota, raw.cpu_set, raw.unreadable_level) == (None, None, None)
+    assert (raw.quota, raw.cpu_set, raw.unreadable_level, raw.unlocated_file) == (None, None, None, None)
 
 
 def test_read_cpu_when_the_job_says_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
     """Calls a job that will not answer unreadable here too, so no looser answer is invented."""
     monkeypatch.setattr(_windows, '_query', answering())
 
-    assert _windows.read_cpu().unreadable_level == 'job'
+    raw = _windows.read_cpu()
+
+    assert (raw.unreadable_level, raw.unlocated_file) == ('job', None)
 
 
 def test_read_cpu_takes_both_restrictions(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -304,6 +317,7 @@ def test_read_cpu_takes_both_restrictions(monkeypatch: pytest.MonkeyPatch) -> No
     assert raw.quota.cores == 1.5
     assert raw.cpu_set is not None
     assert raw.cpu_set.cores == 3
+    assert raw.unlocated_file is None
 
 
 def test_read_cpu_without_the_machine_cores(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -322,7 +336,7 @@ def test_read_cpu_without_the_machine_cores(monkeypatch: pytest.MonkeyPatch) -> 
     raw = _windows.read_cpu()
 
     assert raw.unconvertible_level == 'job'
-    assert (raw.quota, raw.cpu_set, raw.unreadable_level) == (None, None, None)
+    assert (raw.quota, raw.cpu_set, raw.unreadable_level, raw.unlocated_file) == (None, None, None, None)
 
 
 def test_read_cpu_keeps_an_affinity_without_the_machine_cores(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -355,7 +369,7 @@ def test_read_cpu_when_only_the_rate_control_is_silent(monkeypatch: pytest.Monke
 
     raw = _windows.read_cpu()
 
-    assert (raw.quota, raw.cpu_set, raw.unreadable_level) == (None, None, 'job')
+    assert (raw.quota, raw.cpu_set, raw.unreadable_level, raw.unlocated_file) == (None, None, 'job', None)
 
 
 def test_machine_cpu_count_falls_back_on_one_group(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -396,7 +410,7 @@ def test_read_cpu_when_the_affinity_cannot_be_counted(monkeypatch: pytest.Monkey
 
     raw = _windows.read_cpu()
 
-    assert (raw.quota, raw.cpu_set, raw.unreadable_level) == (None, None, 'job')
+    assert (raw.quota, raw.cpu_set, raw.unreadable_level, raw.unlocated_file) == (None, None, 'job', None)
 
 
 def test_read_cpu_ignores_the_single_group_mask(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -458,6 +472,7 @@ def test_sources_without_a_job(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert sources.memory is not None
     assert sources.memory.levels == ()
+    assert sources.unlocated_file is None
 
 
 def test_in_job_without_a_job(monkeypatch: pytest.MonkeyPatch) -> None:

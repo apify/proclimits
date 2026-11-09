@@ -65,6 +65,20 @@ class NoticeCode(str, Enum):
     CPU_METRICS_UNAVAILABLE = 'cpu-metrics-unavailable'
     """No mechanism here is present to carry a CPU limit: an unsupported platform, or none is mounted."""
 
+    MEMORY_METRICS_UNREADABLE = 'memory-metrics-unreadable'
+    """Where a memory limit would be read from cannot be located, because a `/proc` file cannot be read.
+
+    Nothing is reported. A read that failed, so the next reading tries again. The message names the file and
+    the reason.
+    """
+
+    CPU_METRICS_UNREADABLE = 'cpu-metrics-unreadable'
+    """Where a CPU limit would be read from cannot be located, because a `/proc` file cannot be read.
+
+    Nothing is reported. A read that failed, so the next reading tries again. The message names the file and
+    the reason.
+    """
+
     MEMORY_LIMIT_UNREADABLE = 'memory-limit-unreadable'
     """A level holds a memory limit that says nothing usable, so what it enforces is unknown."""
 
@@ -145,10 +159,19 @@ class Sources:
     cpu_usage: Source | None
     """Carries the consumed CPU time, which a mechanism may count somewhere other than where it limits."""
 
+    unlocated_file: str | None
+    """The file that kept the sources from being located, and why, as `<path> (<reason>)`. `None` where none did.
+
+    Set, every source is `None`, and the next lookup tries again.
+    """
+
 
 @dataclass(frozen=True)
 class RawMemory:
-    """The memory limit and usage as the mechanism spells them."""
+    """The memory limit and usage as the mechanism spells them.
+
+    Where `unlocated_file` is set, no level was read and every other field is `None`.
+    """
 
     limit: int | None
     """The tightest limit along the chain, in bytes. `None` when no level holds one.
@@ -200,6 +223,13 @@ class RawMemory:
     no level to name.
     """
 
+    unlocated_file: str | None
+    """The `/proc` file this reading could not read to locate its controller, and why, as `<path> (<reason>)`.
+
+    `None` where the lookup succeeded or found no `/proc`. A job object is not located through `/proc`, so it is
+    always `None` there.
+    """
+
 
 @dataclass(frozen=True)
 class RawCpuQuota:
@@ -247,7 +277,8 @@ class RawCpuSet:
 class RawCpu:
     """Everything the CPU controls say, read in one go.
 
-    A level that says nothing usable concerns both restrictions, so they are read together.
+    A level that says nothing usable concerns both restrictions, so they are read together. Where
+    `unlocated_file` is set, no level was read and every other field is `None`.
     """
 
     quota: RawCpuQuota | None
@@ -269,4 +300,11 @@ class RawCpu:
     A share says nothing about cores on its own, so the reading is dropped and the level is named here. Only
     mechanisms that express a limit that way ever set this - a cgroup states cores outright, so it is always
     `None` there.
+    """
+
+    unlocated_file: str | None
+    """The `/proc` file this reading could not read to locate its controllers, and why, as `<path> (<reason>)`.
+
+    `None` where the lookup succeeded or found no `/proc`. A job object is not located through `/proc`, so it is
+    always `None` there.
     """

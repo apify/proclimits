@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import errno
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from pathlib import Path, PurePosixPath
 
@@ -152,6 +153,24 @@ class _UnreadableFileError(Exception):
         """The level that could not be read."""
 
 
+class _UnreadableProcFileError(Exception):
+    """A `/proc` file that discovery reads failed for a reason other than its absence.
+
+    The error the read raised may name no file. One raised after the file was opened does not, and neither does
+    a `ValueError`. So this error prints as the file and the reason. The reason is the errno name where there is
+    one, and the kind of error otherwise.
+    """
+
+    def __init__(self, path: Path, error: OSError | ValueError) -> None:
+        # The errno tells a process out of file descriptors, EMFILE, from a file nobody may read, EACCES.
+        reason = (
+            errno.errorcode.get(error.errno, str(error.errno))
+            if isinstance(error, OSError) and error.errno is not None
+            else type(error).__name__
+        )
+        super().__init__(f'{path} ({reason})')
+
+
 @dataclass(frozen=True)
 class _Mount:
     """One line of the mount table, as far as this module cares."""
@@ -226,7 +245,8 @@ class Controllers:
     """The controllers that carry resource metrics, as located for this process."""
 
     interface: Interface | None
-    """The interface holding this process, whatever it carries. `None` where no hierarchy holds it at all.
+    """The interface holding this process, whatever it carries. `None` where no hierarchy holds it at all, or
+    where none can be located right now.
 
     Named once for the machine rather than per metric, so that a metric no hierarchy carries is still
     reported against the mechanism that would have carried it. A located controller names its own interface.
@@ -243,6 +263,24 @@ class Controllers:
 
     cpu_set: Controller | None
     """Carries the set of cores the cgroup may run on."""
+
+    unlocated_file: str | None
+    """The `/proc` file that could not be read, and why, as `<path> (<reason>)`. `None` where none failed.
+
+    Set, nothing is located, and the next lookup tries again.
+    """
+
+
+_NO_CONTROLLERS = Controllers(
+    interface=None,
+    memory=None,
+    cpu_quota=None,
+    cpu_usage=None,
+    cpu_set=None,
+    unlocated_file=None,
+)
+"""Nothing located. Discovery answers this where `/proc` is not there, and a failed lookup adds the file it could
+not read."""
 
 
 @dataclass(frozen=True)
@@ -297,8 +335,12 @@ _NO_MEMORY = RawMemory(
     limit_level=None,
     unreadable_level=None,
     usage_unreadable_level=None,
+    unlocated_file=None,
 )
 """What is reported where no level holds a memory limit at all."""
+
+_NO_CPU = RawCpu(quota=None, cpu_set=None, unreadable_level=None, unconvertible_level=None, unlocated_file=None)
+"""Nothing read. A reading that fails adds what it could not read."""
 
 
 def read_memory() -> RawMemory:
@@ -307,8 +349,17 @@ def read_memory() -> RawMemory:
     An out-of-memory kill follows from how much memory can still be allocated, not from a ratio. The smallest
     distance to a limit anywhere along the chain is therefore the quantity carried over, expressed against the
     tightest limit so that a consumer sees one comparable pair.
+
+    Where a `/proc` file keeps the controller from being located, nothing is read and `unlocated_file` names it.
     """
-    controller = locate_controllers().memory
+    controllers = locate_controllers()
+
+    # A failed lookup locates no controller, as a machine without one does. The reading names the file, so the
+    # two stay apart even where a later lookup succeeds.
+    if controllers.unlocated_file is not None:
+        return replace(_NO_MEMORY, unlocated_file=controllers.unlocated_file)
+
+    controller = controllers.memory
     if controller is None:
         return _NO_MEMORY
 
@@ -323,6 +374,7 @@ def read_memory() -> RawMemory:
             limit_level=None,
             unreadable_level=str(unreadable.directory),
             usage_unreadable_level=None,
+            unlocated_file=None,
         )
 
     if not levels:
@@ -344,6 +396,7 @@ def read_memory() -> RawMemory:
             limit_level=str(tightest.directory),
             unreadable_level=None,
             usage_unreadable_level=str(min_distance_level.directory),
+            unlocated_file=None,
         )
 
     return RawMemory(
@@ -354,6 +407,7 @@ def read_memory() -> RawMemory:
         limit_level=str(tightest.directory),
         unreadable_level=None,
         usage_unreadable_level=None,
+        unlocated_file=None,
     )
 
 
@@ -385,20 +439,33 @@ def _read_memory_levels(controller: Controller) -> list[_MemoryLevel]:
 
 
 def read_cpu() -> RawCpu:
-    """Read both CPU restrictions, and the level that said nothing usable if there was one."""
+    """Read both CPU restrictions, and the level that said nothing usable if there was one.
+
+    Where a `/proc` file keeps the controllers from being located, nothing is read and `unlocated_file` names it.
+    """
+    # One lookup for both readings, and neither looks up on its own. A quota whose lookup failed beside a set
+    # whose lookup recovered would report the set, which can be looser.
+    controllers = locate_controllers()
+    if controllers.unlocated_file is not None:
+        return replace(_NO_CPU, unlocated_file=controllers.unlocated_file)
+
     try:
         return RawCpu(
-            quota=read_cpu_quota(),
-            cpu_set=read_cpu_set_size(),
+            quota=read_cpu_quota(controllers),
+            cpu_set=read_cpu_set_size(controllers),
             unreadable_level=None,
             unconvertible_level=None,
+            unlocated_file=None,
         )
     except _UnreadableFileError as unreadable:
-        return RawCpu(quota=None, cpu_set=None, unreadable_level=str(unreadable.directory), unconvertible_level=None)
+        return replace(_NO_CPU, unreadable_level=str(unreadable.directory))
 
 
-def read_cpu_quota() -> RawCpuQuota | None:
+def read_cpu_quota(controllers: Controllers) -> RawCpuQuota | None:
     """Read the tightest CPU bandwidth quota along the chain, and the level it binds at.
+
+    Args:
+        controllers: The lookup this reading uses.
 
     Returns:
         The quota, or `None` when no level sets one. Taken as read: a quota can exceed the cores of the
@@ -408,7 +475,7 @@ def read_cpu_quota() -> RawCpuQuota | None:
         _UnreadableFileError: If a level holds a quota file that says nothing usable. `read_cpu` turns that
             into a reading of nothing.
     """
-    controller = locate_controllers().cpu_quota
+    controller = controllers.cpu_quota
     if controller is None:
         return None
 
@@ -424,12 +491,15 @@ def read_cpu_quota() -> RawCpuQuota | None:
     return RawCpuQuota(
         cores=cores,
         limit_level=str(directory),
-        usage_level=_cpu_usage_level(directory, controller),
+        usage_level=_cpu_usage_level(directory, controller, controllers.cpu_usage),
     )
 
 
-def read_cpu_set_size() -> RawCpuSet | None:
+def read_cpu_set_size(controllers: Controllers) -> RawCpuSet | None:
     """Read the set of CPU cores the cgroup of this process may run on.
+
+    Args:
+        controllers: The lookup this reading uses.
 
     Returns:
         The set, or `None` when no level sets one. Taken as read: a set can cover every core of the machine.
@@ -438,7 +508,7 @@ def read_cpu_set_size() -> RawCpuSet | None:
         _UnreadableFileError: If the level holds a set that says nothing usable. `read_cpu` turns that into a
             reading of nothing.
     """
-    controller = locate_controllers().cpu_set
+    controller = controllers.cpu_set
     if controller is None:
         return None
 
@@ -457,7 +527,7 @@ def read_cpu_set_size() -> RawCpuSet | None:
     return RawCpuSet(
         cores=cores,
         limit_level=str(directory),
-        usage_level=_cpu_usage_level(directory, controller),
+        usage_level=_cpu_usage_level(directory, controller, controllers.cpu_usage),
     )
 
 
@@ -524,19 +594,34 @@ def read_cpu_usage(level: str | None = None) -> float | None:
     return nanoseconds / _NANOSECONDS_PER_SECOND if nanoseconds is not None else None
 
 
-@lru_cache(maxsize=1)
 def locate_controllers() -> Controllers:
     """Locate the control files carrying the resource metrics of this process.
 
-    Discovery walks `/proc` and is cached until `clear_cache()` forgets it. The control files themselves are
-    read again on every sample.
+    Discovery walks `/proc`, and what it finds is kept until `clear_cache()` forgets it. A `/proc` file that
+    cannot be read is not kept: nothing is located, the file is named, and the next lookup tries again. The
+    control files themselves are read again on every sample.
+    """
+    try:
+        return _discover_controllers()
+    except _UnreadableProcFileError as unreadable:
+        return replace(_NO_CONTROLLERS, unlocated_file=str(unreadable))
+
+
+@lru_cache(maxsize=1)
+def _discover_controllers() -> Controllers:
+    """Locate the controllers by walking `/proc`, and keep the answer.
+
+    `lru_cache` keeps no exception, so a failure raised from here is read again on the next lookup.
+
+    Raises:
+        _UnreadableProcFileError: If a `/proc` file that discovery reads fails for a reason other than its absence.
     """
     # Each metric is located on its own, because a machine can serve them through different interfaces.
     try:
         hierarchies = _read_hierarchies()
-    except (OSError, ValueError):
-        # Not Linux, or `/proc` is not mounted. Nothing to read either way.
-        return Controllers(interface=None, memory=None, cpu_quota=None, cpu_usage=None, cpu_set=None)
+    except (FileNotFoundError, NotADirectoryError):
+        # Not Linux, or `/proc` is not mounted. That lasts as long as the process, so it is kept.
+        return _NO_CONTROLLERS
 
     return Controllers(
         interface=_interface(hierarchies),
@@ -544,6 +629,7 @@ def locate_controllers() -> Controllers:
         cpu_quota=_locate_controller(hierarchies, _CPU_QUOTA),
         cpu_usage=_locate_cpu_usage(hierarchies),
         cpu_set=_locate_controller(hierarchies, _CPU_SET),
+        unlocated_file=None,
     )
 
 
@@ -577,6 +663,7 @@ def sources() -> Sources:
         cpu_quota=_source(controllers.cpu_quota, controllers.interface),
         cpu_set=_source(controllers.cpu_set, controllers.interface),
         cpu_usage=_source(controllers.cpu_usage, controllers.interface),
+        unlocated_file=controllers.unlocated_file,
     )
 
 
@@ -584,7 +671,8 @@ def _source(controller: Controller | None, interface: Interface | None) -> Sourc
     """Spell one metric as a source."""
     if controller is None:
         # A hierarchy that carries no such controller searched no levels, and `None` is kept for the machine
-        # that has no hierarchy at all - the sensor layer reads that as "nothing here can say".
+        # where no hierarchy is located at all - the sensor layer reads that as "nothing here can say", or as
+        # "cannot be located right now" where `unlocated_file` is set.
         return Source(interface=interface, levels=()) if interface is not None else None
 
     return Source(
@@ -685,7 +773,7 @@ def _machine_cpu_count_fallback() -> int | None:
 
 def clear_cache() -> None:
     """Forget the located controllers. The next reading discovers them again."""
-    locate_controllers.cache_clear()
+    _discover_controllers.cache_clear()
 
 
 # A child of `fork` inherits what its parent discovered. A pre-fork server whose supervisor puts each worker
@@ -730,14 +818,13 @@ def _bound_controllers(hierarchy: _Hierarchy) -> list[str]:
         return []
 
 
-def _cpu_usage_level(directory: Path, source: Controller) -> str | None:
+def _cpu_usage_level(directory: Path, source: Controller, usage: Controller | None) -> str | None:
     """Find where the CPU time of one level is counted, given that level in another hierarchy.
 
     Under cgroup v1 the quota and the accounting can be two hierarchies with two mount points, so the level
     is translated by its path below the mount point. Every chain ends at its own mount point, which is what
-    makes that path comparable.
+    makes that path comparable. `usage` is the counter located by the same lookup as `source`.
     """
-    usage = locate_controllers().cpu_usage
     if usage is None:
         return None
 
@@ -879,7 +966,9 @@ def _read_hierarchies() -> _Hierarchies:
     """Locate the mounted cgroup hierarchies and the cgroup this process belongs to in each.
 
     Raises:
-        OSError: If `/proc/self/mountinfo` or `/proc/self/cgroup` cannot be read.
+        FileNotFoundError: If `/proc/self/mountinfo` or `/proc/self/cgroup` is not there.
+        NotADirectoryError: If a directory on the path to either is not one.
+        _UnreadableProcFileError: If either cannot be read for any other reason.
     """
     unified_path, controller_paths = _read_own_paths()
     mounts = _read_mounts()
@@ -947,11 +1036,11 @@ def _read_mounts() -> list[_Mount]:
     """Read the mount table, skipping the lines that are not mount entries.
 
     Raises:
-        OSError: If `/proc/self/mountinfo` cannot be read.
+        FileNotFoundError: If `/proc/self/mountinfo` is not there.
+        NotADirectoryError: If a directory on its path is not one.
+        _UnreadableProcFileError: If it cannot be read for any other reason.
     """
-    # `errors='replace'` because a foreign mount point with non-UTF-8 bytes must not hide our own cgroup.
-    # Such a path decodes to something that matches no file, so only that mount drops out.
-    lines = _PROC_SELF_MOUNTINFO.read_text(errors='replace').splitlines()
+    lines = _read_proc_file(_PROC_SELF_MOUNTINFO).splitlines()
 
     return [mount for line in lines if (mount := _parse_mount(line)) is not None]
 
@@ -978,12 +1067,14 @@ def _read_own_paths() -> tuple[str | None, dict[str, str]]:
     """Read the cgroup this process belongs to in the unified hierarchy and in each cgroup v1 one.
 
     Raises:
-        OSError: If `/proc/self/cgroup` cannot be read.
+        FileNotFoundError: If `/proc/self/cgroup` is not there.
+        NotADirectoryError: If a directory on its path is not one.
+        _UnreadableProcFileError: If it cannot be read for any other reason.
     """
     unified: str | None = None
     controllers: dict[str, str] = {}
 
-    for line in _PROC_SELF_CGROUP.read_text(errors='replace').splitlines():
+    for line in _read_proc_file(_PROC_SELF_CGROUP).splitlines():
         try:
             _hierarchy_id, controller_list, cgroup_path = line.split(':', 2)
         except ValueError:
@@ -999,6 +1090,45 @@ def _read_own_paths() -> tuple[str | None, dict[str, str]]:
             controllers[controller.removeprefix('name=')] = cgroup_path
 
     return unified, controllers
+
+
+def _read_proc_file(path: Path) -> str:
+    """Read a `/proc` file that discovery depends on, telling an absent one from one that cannot be read.
+
+    Raises:
+        FileNotFoundError: If the file is not there.
+        NotADirectoryError: If a directory on its path is not one.
+        _UnreadableProcFileError: If it cannot be read for any other reason. It names the file.
+    """
+    try:
+        # `errors='replace'` because a foreign mount point with non-UTF-8 bytes must not hide our own cgroup.
+        # Such a path decodes to something that matches no file, so only that mount drops out.
+        return path.read_text(errors='replace')
+    except (FileNotFoundError, NotADirectoryError):
+        raise
+    except (OSError, ValueError) as error:
+        # Out of file descriptors, opening an absent file fails with EMFILE rather than ENOENT.
+        if _is_absent(path):
+            raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), str(path)) from error
+
+        raise _UnreadableProcFileError(path, error) from error
+
+
+def _is_absent(path: Path) -> bool:
+    """Whether a stat finds nothing at `path`.
+
+    A stat needs no file descriptor, so it answers where an open failed for want of one. Unlike `_exists`, it takes
+    no other failure for absence. Discovery keeps an absent `/proc`, so an EACCES taken for absence would not be
+    read again.
+    """
+    try:
+        path.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return True
+    except (OSError, ValueError):
+        return False
+
+    return False
 
 
 def _unescape(field: str) -> str:

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import os
 import threading
 from itertools import count
+from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
@@ -21,11 +23,11 @@ from .conftest import (
     V1_SELF_CGROUP,
     V2_MOUNTINFO,
     V2_SELF_CGROUP,
+    fail_to_read,
 )
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from pathlib import Path
 
 MACHINE_TOTAL_BYTES = 8 * 1024**3
 MACHINE_CORES = 8
@@ -201,6 +203,7 @@ def test_get_memory_budget_usage_the_mechanism_does_not_offer(monkeypatch: pytes
         limit_level='job',
         unreadable_level=None,
         usage_unreadable_level=None,
+        unlocated_file=None,
     )
     monkeypatch.setattr(_backend, 'read_memory', lambda: raw)
 
@@ -218,6 +221,7 @@ def test_get_memory_budget_brings_a_disagreeing_triple_into_range(monkeypatch: p
         limit_level='job',
         unreadable_level=None,
         usage_unreadable_level=None,
+        unlocated_file=None,
     )
     monkeypatch.setattr(_backend, 'read_memory', lambda: raw)
 
@@ -238,6 +242,7 @@ def test_get_memory_budget_keeps_a_room_the_mechanism_made_smaller(monkeypatch: 
         limit_level='job',
         unreadable_level=None,
         usage_unreadable_level=None,
+        unlocated_file=None,
     )
     monkeypatch.setattr(_backend, 'read_memory', lambda: raw)
 
@@ -395,8 +400,8 @@ def test_get_cpu_limit(
         if cpu_set_cores is None
         else _cgroup.RawCpuSet(cores=cpu_set_cores, limit_level=counter, usage_level=counter)
     )
-    monkeypatch.setattr(_cgroup, 'read_cpu_quota', lambda: raw_quota)
-    monkeypatch.setattr(_cgroup, 'read_cpu_set_size', lambda: raw_set)
+    monkeypatch.setattr(_cgroup, 'read_cpu_quota', lambda _controllers: raw_quota)
+    monkeypatch.setattr(_cgroup, 'read_cpu_set_size', lambda _controllers: raw_set)
     monkeypatch.setattr(_sensor, 'get_machine_cpu_count', lambda: machine_cores)
 
     assert proclimits.get_cpu_limit() == expected
@@ -407,9 +412,9 @@ def test_get_cpu_limit_notices(monkeypatch: pytest.MonkeyPatch) -> None:
     """Explains each reading that covers the machine, so a missing limit is attributable."""
     counter = '/sys/fs/cgroup'
     quota = _cgroup.RawCpuQuota(cores=10.0, limit_level=counter, usage_level=counter)
-    monkeypatch.setattr(_cgroup, 'read_cpu_quota', lambda: quota)
+    monkeypatch.setattr(_cgroup, 'read_cpu_quota', lambda _controllers: quota)
     cpu_set = _cgroup.RawCpuSet(cores=8, limit_level=counter, usage_level=counter)
-    monkeypatch.setattr(_cgroup, 'read_cpu_set_size', lambda: cpu_set)
+    monkeypatch.setattr(_cgroup, 'read_cpu_set_size', lambda _controllers: cpu_set)
 
     assert proclimits.get_cpu_limit() is None
     assert notice_codes('cpu') == ('cpu-quota-covers-machine', 'cpu-set-covers-machine')
@@ -417,7 +422,9 @@ def test_get_cpu_limit_notices(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_cpu_limit_from_an_unsizeable_share(monkeypatch: pytest.MonkeyPatch) -> None:
     """Reports nothing, and names the level, where a limit is a share of a machine of unknown size."""
-    raw = _cgroup.RawCpu(quota=None, cpu_set=None, unreadable_level=None, unconvertible_level='job')
+    raw = _cgroup.RawCpu(
+        quota=None, cpu_set=None, unreadable_level=None, unconvertible_level='job', unlocated_file=None
+    )
     monkeypatch.setattr(_backend, 'read_cpu', lambda: raw)
 
     assert proclimits.get_cpu_limit() is None
@@ -433,6 +440,7 @@ def test_an_unsizeable_share_drops_the_other_reading(monkeypatch: pytest.MonkeyP
         cpu_set=_cgroup.RawCpuSet(cores=2, limit_level=counter, usage_level=counter),
         unreadable_level=None,
         unconvertible_level='job',
+        unlocated_file=None,
     )
     monkeypatch.setattr(_backend, 'read_cpu', lambda: raw)
 
@@ -958,8 +966,8 @@ def test_covers_machine_notice_spells_the_cores(monkeypatch: pytest.MonkeyPatch)
     """Says "64 allowed cores" in the message a consumer reads, not "64.0" - a set has no fractional size."""
     counter = '/sys/fs/cgroup'
     cpu_set = _cgroup.RawCpuSet(cores=64, limit_level=counter, usage_level=counter)
-    monkeypatch.setattr(_cgroup, 'read_cpu_quota', lambda: None)
-    monkeypatch.setattr(_cgroup, 'read_cpu_set_size', lambda: cpu_set)
+    monkeypatch.setattr(_cgroup, 'read_cpu_quota', lambda _controllers: None)
+    monkeypatch.setattr(_cgroup, 'read_cpu_set_size', lambda _controllers: cpu_set)
 
     (notice,) = [n for n in proclimits.describe().notices if str(n.code) == 'cpu-set-covers-machine']
 
@@ -1013,6 +1021,228 @@ def test_clear_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_cgrou
     assert proclimits.get_memory_budget() == proclimits.MemoryBudget(
         limit=536870912, used=100000000, available=436870912
     )
+
+
+def test_a_failed_lookup_is_named_and_retried(
+    fake_cgroup: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Names the `/proc` file while lookups fail, and reports the limit once one succeeds, with no cache cleared."""
+    fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/'),
+        files={
+            'memory.max': '536870912\n',
+            'memory.current': '150000000\n',
+            'memory.stat': 'inactive_file 50000000\n',
+        },
+    )
+    refused = _cgroup._PROC_SELF_CGROUP
+    read_text = Path.read_text
+    failing = True
+
+    def read_unless_failing(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+        if failing and path == refused:
+            raise OSError(errno.EMFILE, os.strerror(errno.EMFILE))
+        return read_text(path, encoding=encoding, errors=errors)
+
+    monkeypatch.setattr(Path, 'read_text', read_unless_failing)
+
+    description = proclimits.describe()
+
+    assert [(str(notice.code), notice.message) for notice in description.notices] == [
+        (
+            'memory-metrics-unreadable',
+            (
+                f'Where a memory limit would be read from cannot be located, because {refused} (EMFILE) cannot be '
+                'read. Nothing is reported, and the next reading tries again.'
+            ),
+        ),
+        (
+            'cpu-metrics-unreadable',
+            (
+                f'Where a CPU limit would be read from cannot be located, because {refused} (EMFILE) cannot be '
+                'read. Nothing is reported, and the next reading tries again.'
+            ),
+        ),
+    ]
+    assert description.memory_source is None
+    assert description.cpu_quota_source is None
+    assert description.cpu_set_source is None
+    assert description.cpu_usage_source is None
+    assert proclimits.get_memory_budget() is None
+
+    failing = False
+
+    assert proclimits.get_memory_budget() == proclimits.MemoryBudget(
+        limit=536870912, used=100000000, available=436870912
+    )
+    assert proclimits.describe().notices == ()
+
+
+def fail_the_first_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the first read of `/proc/self/cgroup` raise EMFILE, and read it as usual after that."""
+    fail_to_read(monkeypatch, _cgroup._PROC_SELF_CGROUP, OSError(errno.EMFILE, os.strerror(errno.EMFILE)), times=1)
+
+
+def test_a_failed_lookup_reports_no_looser_cpu_limit(
+    fake_cgroup: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reports no CPU limit while a lookup fails, and says why, rather than a looser set the next lookup locates."""
+    fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/'),
+        files={'cpu.max': '200000 100000\n', 'cpuset.cpus.effective': '0-3\n', 'cpu.stat': 'usage_usec 0\n'},
+    )
+    refused = _cgroup._PROC_SELF_CGROUP
+    fail_the_first_lookup(monkeypatch)
+
+    # Evaluated directly: `describe()` reads memory first, and that reading would take the one failure.
+    evaluation = _sensor._evaluate_cpu_limit(MACHINE_CORES)
+
+    # Only the first `/proc` read fails. It is named, and the set of 4 cores must not stand in for the quota of 2.
+    assert (evaluation.effective, evaluation.raw_quota, evaluation.raw_set_size) == (None, None, None)
+    assert [(str(notice.code), notice.message) for notice in evaluation.notices] == [
+        (
+            'cpu-metrics-unreadable',
+            (
+                f'Where a CPU limit would be read from cannot be located, because {refused} (EMFILE) cannot be '
+                'read. Nothing is reported, and the next reading tries again.'
+            ),
+        ),
+    ]
+
+    # The same through the public call. No lookup has succeeded yet, so one more failure reaches it.
+    fail_the_first_lookup(monkeypatch)
+
+    assert proclimits.get_cpu_limit() is None
+    assert proclimits.get_cpu_limit() == 2.0
+
+
+def test_a_cache_cleared_during_a_cpu_reading_reports_no_looser_set(
+    fake_cgroup: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reads the quota and the set from one lookup, so a cache cleared in between cannot drop the quota."""
+    fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/'),
+        files={'cpu.max': '200000 100000\n', 'cpuset.cpus.effective': '0-3\n', 'cpu.stat': 'usage_usec 0\n'},
+    )
+    locate = _cgroup.locate_controllers
+    raced: list[None] = []
+
+    def locate_then_clear() -> _cgroup.Controllers:
+        controllers = locate()
+        if not raced:
+            # Another thread forgets the discovery right after the first lookup, and the next `/proc` read fails.
+            raced.append(None)
+            _cgroup.clear_cache()
+            fail_the_first_lookup(monkeypatch)
+        return controllers
+
+    monkeypatch.setattr(_cgroup, 'locate_controllers', locate_then_clear)
+
+    evaluation = _sensor._evaluate_cpu_limit(MACHINE_CORES)
+
+    # A second lookup inside the reading would fail here, lose the quota of 2 and report the set of 4 unexplained.
+    assert (evaluation.effective, evaluation.raw_quota, evaluation.raw_set_size) == (2.0, 2.0, 4)
+    assert evaluation.notices == ()
+
+
+def test_a_failed_memory_lookup_is_named_when_the_next_one_succeeds(
+    fake_cgroup: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Names the `/proc` file the memory reading could not read, though the lookups after it in the call succeed."""
+    fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/'),
+        files={
+            'memory.max': '536870912\n',
+            'memory.current': '150000000\n',
+            'memory.stat': 'inactive_file 50000000\n',
+            'cpu.max': '200000 100000\n',
+            'cpu.stat': 'usage_usec 0\n',
+        },
+    )
+    refused = _cgroup._PROC_SELF_CGROUP
+    fail_the_first_lookup(monkeypatch)
+
+    description = proclimits.describe()
+
+    # `describe()` reads memory first, so that reading takes the one failure. The CPU reading after it locates
+    # its controllers and comes back as usual.
+    assert [(str(notice.code), notice.message) for notice in description.notices] == [
+        (
+            'memory-metrics-unreadable',
+            (
+                f'Where a memory limit would be read from cannot be located, because {refused} (EMFILE) cannot be '
+                'read. Nothing is reported, and the next reading tries again.'
+            ),
+        ),
+    ]
+    assert (description.memory_budget, description.raw_memory_limit) == (None, None)
+    assert description.cpu_limit == 2.0
+    assert description.cpu_quota_source is not None
+    # The sources are located after the readings, so a lookup that succeeded since fills this one.
+    assert description.memory_source is not None
+    assert proclimits.get_memory_budget() == proclimits.MemoryBudget(
+        limit=536870912, used=100000000, available=436870912
+    )
+
+
+@pytest.mark.parametrize(
+    ('reading', 'code'),
+    [
+        pytest.param('read_memory', 'memory-metrics-unreadable', id='memory'),
+        pytest.param('read_cpu', 'cpu-metrics-unreadable', id='cpu'),
+    ],
+)
+def test_a_cache_cleared_after_a_reading_is_not_a_missing_mechanism(
+    fake_cgroup: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    reading: str,
+    code: str,
+) -> None:
+    """Names the failed lookup, rather than a missing mechanism, where the cache is cleared and `/proc` then fails."""
+    fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/'),
+        # Controllers that limit nothing, so each reading goes on to ask whether a mechanism is here at all.
+        files={
+            'memory.current': '1\n',
+            'memory.stat': 'inactive_file 0\n',
+            'cpu.max': 'max 100000\n',
+            'cpu.stat': 'usage_usec 1\n',
+        },
+    )
+    read = getattr(_backend, reading)
+
+    def read_then_clear() -> _types.RawMemory | _types.RawCpu:
+        raw = read()
+        # Another thread forgets the discovery here, and the next `/proc` read fails.
+        _cgroup.clear_cache()
+        fail_the_first_lookup(monkeypatch)
+        return raw
+
+    monkeypatch.setattr(_backend, reading, read_then_clear)
+
+    assert [str(notice.code) for notice in proclimits.describe().notices] == [code]
+
+
+@pytest.mark.usefixtures('_no_cgroup')
+def test_describe_no_mechanism_messages() -> None:
+    """Says that nothing here carries a limit, which is a fact about the machine rather than a failed read."""
+    messages = {str(notice.code): notice.message for notice in proclimits.describe().notices}
+
+    assert messages == {
+        'memory-metrics-unavailable': 'No mechanism here carries a memory limit, so nothing was read. A Linux '
+        'machine with no cgroup filesystem mounted looks like this, and so does a platform with no backend here.',
+        'cpu-metrics-unavailable': 'No mechanism here carries a CPU limit, so nothing was read. A Linux machine '
+        'with no cgroup filesystem mounted looks like this, and so does a platform with no backend here.',
+    }
 
 
 @pytest.mark.parametrize(
@@ -1235,8 +1465,8 @@ def test_no_rate_without_a_counter_for_the_limit(
         files={'cpu.max': '200000 100000\n', 'cpu.stat': 'usage_usec 0\n'},
     )
     quota = _cgroup.RawCpuQuota(cores=2.0, limit_level='/sys/fs/cgroup', usage_level=None)
-    monkeypatch.setattr(_cgroup, 'read_cpu_quota', lambda: quota)
-    monkeypatch.setattr(_cgroup, 'read_cpu_set_size', lambda: None)
+    monkeypatch.setattr(_cgroup, 'read_cpu_quota', lambda _controllers: quota)
+    monkeypatch.setattr(_cgroup, 'read_cpu_set_size', lambda _controllers: None)
 
     # The limit itself still applies and is still reported.
     assert proclimits.get_cpu_limit() == 2.0
