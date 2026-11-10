@@ -42,12 +42,15 @@ _CONVENTIONAL_MOUNT_POINT = Path('/sys/fs/cgroup')
 class _FileNames:
     """What one cgroup interface calls the files this module reads.
 
-    The two interfaces name the files differently. cgroup v2 also has a second file read as a memory limit. Both
-    differences are tabled here.
+    The two interfaces name the files differently. cgroup v2 also has a memory throttle limit. Both differences
+    are tabled here.
     """
 
-    memory_limits: tuple[str, ...]
-    """The files holding the memory limits of one level."""
+    memory_limit: str
+    """Holds the hard memory limit."""
+
+    memory_throttle_limit: str | None
+    """Holds the memory usage throttle limit. `None` under cgroup v1."""
 
     memory_usage: str
     """Holds the memory charged to the cgroup, page cache included."""
@@ -75,7 +78,8 @@ class _FileNames:
 
 
 _V2 = _FileNames(
-    memory_limits=('memory.max', 'memory.high'),
+    memory_limit='memory.max',
+    memory_throttle_limit='memory.high',
     memory_usage='memory.current',
     memory_stat='memory.stat',
     inactive_file='inactive_file',
@@ -87,7 +91,8 @@ _V2 = _FileNames(
 )
 
 _V1 = _FileNames(
-    memory_limits=('memory.limit_in_bytes',),
+    memory_limit='memory.limit_in_bytes',
+    memory_throttle_limit=None,
     memory_usage='memory.usage_in_bytes',
     memory_stat='memory.stat',
     inactive_file='total_inactive_file',
@@ -300,7 +305,7 @@ class _MemoryLevel:
     """One level of the chain that holds a memory limit."""
 
     limit: int
-    """The tightest limit that level holds, in bytes."""
+    """The tightest limit counted at that level, in bytes."""
 
     usage: _MemoryUsage | None
     """What that level is charged, or `None` when it cannot be read."""
@@ -335,13 +340,13 @@ _NO_MEMORY = RawMemory(
     usage_unreadable_level=None,
     unlocated_file=None,
 )
-"""What is reported where no level holds a memory limit at all."""
+"""What is reported where no level holds a memory limit that counts."""
 
 _NO_CPU = RawCpu(quota=None, cpu_set=None, unreadable_level=None, unconvertible_level=None, unlocated_file=None)
 """Nothing read. A reading that fails adds what it could not read."""
 
 
-def read_memory() -> RawMemory:
+def read_memory(*, throttle_limits: bool = False) -> RawMemory:
     """Read the tightest memory limit along the chain, with a usage that keeps the distance to it.
 
     The kernel acts on the distance to a limit, not on a ratio. The smallest distance to a limit anywhere
@@ -349,6 +354,10 @@ def read_memory() -> RawMemory:
     consumer sees one comparable pair.
 
     Where a `/proc` file keeps the controller from being located, nothing is read and `unlocated_file` names it.
+
+    Args:
+        throttle_limits: Whether a level's limit is the tighter of `memory.max` and `memory.high`. cgroup v1
+            reads `memory.limit_in_bytes` either way.
     """
     controllers = locate_controllers()
 
@@ -362,7 +371,7 @@ def read_memory() -> RawMemory:
         return _NO_MEMORY
 
     try:
-        levels = _read_memory_levels(controller)
+        levels = _read_memory_levels(controller, throttle_limits=throttle_limits)
     except _UnreadableFileError as unreadable:
         return RawMemory(
             limit=None,
@@ -409,7 +418,7 @@ def read_memory() -> RawMemory:
     )
 
 
-def _read_memory_levels(controller: Controller) -> list[_MemoryLevel]:
+def _read_memory_levels(controller: Controller, *, throttle_limits: bool) -> list[_MemoryLevel]:
     """Read the limit and the usage of every level along the chain that holds a limit.
 
     A level with no readable usage is kept: its limit still caps everything below it.
@@ -417,14 +426,18 @@ def _read_memory_levels(controller: Controller) -> list[_MemoryLevel]:
     Raises:
         _UnreadableFileError: If a level holds a limit file that says nothing usable.
     """
+    limit_files = [controller.names.memory_limit]
+    # Opened only on request, so a throttle limit the caller leaves out cannot void the reading.
+    if throttle_limits and controller.names.memory_throttle_limit is not None:
+        limit_files.append(controller.names.memory_throttle_limit)
+
     levels = []
 
     for directory in controller.dirs:
         # `mem_cgroup_wb_stats` in mm/memcontrol.c takes `min(memory.max, memory.high)` as the ceiling of each
-        # level when it works out the room left. The tighter of the two is the limit of the level here too.
-        limits = [
-            found for name in controller.names.memory_limits if (found := _read_limit(directory / name)) is not None
-        ]
+        # level when it works out the room left. Where both are read, the tighter of the two is the limit of the
+        # level here too.
+        limits = [found for name in limit_files if (found := _read_limit(directory / name)) is not None]
         if not limits:
             continue
 

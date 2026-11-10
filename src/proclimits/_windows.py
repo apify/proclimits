@@ -312,12 +312,15 @@ _UNREADABLE_MEMORY = RawMemory(
 _Structure = TypeVar('_Structure', bound=ctypes.Structure)
 
 
-def read_memory() -> RawMemory:
+def read_memory(*, throttle_limits: bool = False) -> RawMemory:  # noqa: ARG001
     """Read the memory limit of the job holding this process, with the memory charged against it.
 
     A job can limit the whole job and each of its processes separately. The job-wide limit is reported with
     its usage. A per-process limit that is tighter, or the only one, is reported without usage: the job's
     usage sums every process and does not pair with it.
+
+    Args:
+        throttle_limits: Ignored. Only the commit limits of a job are read as memory limits.
     """
     limits, error = _query(_JOB_EXTENDED_LIMIT, _ExtendedLimits)
     if limits is None:

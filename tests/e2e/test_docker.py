@@ -92,7 +92,15 @@ def test_host_cgroup_namespace() -> None:
         assert len(reading.sources['memory']['levels']) > 1
 
 
-def test_tighter_limit_inside_the_container() -> None:
+@pytest.mark.parametrize(
+    'limit_file',
+    [
+        pytest.param('memory.max', id='memory.max'),
+        # Only cgroup v2 has `memory.high`.
+        pytest.param('memory.high', id='memory.high', marks=pytest.mark.unified),
+    ],
+)
+def test_tighter_limit_inside_the_container(limit_file: str) -> None:
     """Takes the tightest limit when two levels carry different ones, which is the shape kubelet produces."""
     # The kernel forbids a cgroup that both holds processes and delegates controllers, so the shell vacates
     # the root first, enables the controller, then moves in. `0` is how a process names itself to cgroupfs.
@@ -102,7 +110,7 @@ def test_tighter_limit_inside_the_container() -> None:
         mkdir -p /sys/fs/cgroup/init /sys/fs/cgroup/inner
         echo 0 > /sys/fs/cgroup/init/cgroup.procs
         echo +memory > /sys/fs/cgroup/cgroup.subtree_control
-        echo {TIGHTER_MEMORY_LIMIT} > /sys/fs/cgroup/inner/memory.max
+        echo {TIGHTER_MEMORY_LIMIT} > /sys/fs/cgroup/inner/{limit_file}
         echo 0 > /sys/fs/cgroup/inner/cgroup.procs
     else
         mkdir -p /sys/fs/cgroup/memory/inner
@@ -117,31 +125,8 @@ def test_tighter_limit_inside_the_container() -> None:
         '--memory',
         str(MEMORY_LIMIT),
         command=['sh', '-c', setup],
-    )
-
-    check_invariants(reading)
-    assert reading.memory_limit == TIGHTER_MEMORY_LIMIT
-
-
-@pytest.mark.unified
-def test_memory_high_inside_the_container() -> None:
-    """Takes `memory.high` as the limit where it is tighter than the `memory.max` of the container."""
-    # The layout of `test_tighter_limit_inside_the_container`, with the tighter limit written to `memory.high`.
-    setup = f"""
-    set -e
-    mkdir -p /sys/fs/cgroup/init /sys/fs/cgroup/inner
-    echo 0 > /sys/fs/cgroup/init/cgroup.procs
-    echo +memory > /sys/fs/cgroup/cgroup.subtree_control
-    echo {TIGHTER_MEMORY_LIMIT} > /sys/fs/cgroup/inner/memory.high
-    echo 0 > /sys/fs/cgroup/inner/cgroup.procs
-    exec {probe_command()}
-    """
-
-    reading = probe_in_container(
-        '--privileged',
-        '--memory',
-        str(MEMORY_LIMIT),
-        command=['sh', '-c', setup],
+        # `memory.high` counts only where the caller asks for it.
+        throttle_limits=limit_file == 'memory.high',
     )
 
     check_invariants(reading)

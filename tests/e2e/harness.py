@@ -21,6 +21,9 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_DIR = REPO_ROOT / 'src'
 PROBE = Path(__file__).parent / 'probe.py'
 
+THROTTLE_LIMITS_ENV = 'PROBE_THROTTLE_LIMITS'
+"""The environment variable that has the probe pass `throttle_limits=True` to every reading."""
+
 IMAGE = 'python:3.13-alpine'
 """The image the container tests use. A small musl image, and it ships `PYTHON_VERSION` itself."""
 
@@ -276,12 +279,19 @@ def run(command: list[str], *, env: dict[str, str] | None = None) -> Reading:
     return parse(result.stdout)
 
 
-def probe_here(wrapper: list[str] | None = None, python_version: str | None = None) -> Reading:
+def probe_here(
+    wrapper: list[str] | None = None,
+    python_version: str | None = None,
+    *,
+    throttle_limits: bool = False,
+) -> Reading:
     """Run the probe on this machine, optionally under a wrapper command such as `systemd-run`.
 
     The interpreter is the one running the suite, unless a version is named. uv then installs that one.
     """
     env = {**os.environ, 'PYTHONPATH': str(SRC_DIR)}
+    if throttle_limits:
+        env[THROTTLE_LIMITS_ENV] = '1'
 
     if python_version is None:
         interpreter = [sys.executable, str(PROBE)]
@@ -293,6 +303,8 @@ def probe_here(wrapper: list[str] | None = None, python_version: str | None = No
 
     # A wrapper can strip the environment, so the variables travel as an explicit `env` call.
     passthrough = ['env', f'PYTHONPATH={SRC_DIR}', f'HOME={os.environ.get("HOME", "/root")}']
+    if throttle_limits:
+        passthrough.append(f'{THROTTLE_LIMITS_ENV}=1')
 
     return run([*wrapper, *passthrough, *interpreter], env=env)
 
@@ -353,6 +365,7 @@ def container_command(
     image: str = IMAGE,
     python_version: str = PYTHON_VERSION,
     command: list[str] | None = None,
+    throttle_limits: bool = False,
 ) -> list[str]:
     """Spell the `run` command that starts the probe in a fresh container.
 
@@ -383,6 +396,7 @@ def container_command(
         'UV_CACHE_DIR=/uv/cache',
         '--env',
         'UV_PYTHON_INSTALL_DIR=/uv/python',
+        *(['--env', f'{THROTTLE_LIMITS_ENV}=1'] if throttle_limits else []),
         *engine_args,
         qualified(image, engine),
         *(command or ['sh', '-c', probe_command(python_version)]),
@@ -451,6 +465,7 @@ def probe_in_container(
     image: str = IMAGE,
     python_version: str = PYTHON_VERSION,
     command: list[str] | None = None,
+    throttle_limits: bool = False,
 ) -> Reading:
     """Run the probe in a fresh container. The arguments go to the engine's `run`."""
     return run(
@@ -460,6 +475,7 @@ def probe_in_container(
             image=image,
             python_version=python_version,
             command=command,
+            throttle_limits=throttle_limits,
         )
     )
 

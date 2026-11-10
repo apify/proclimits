@@ -8,7 +8,7 @@ Inside a container the usual answers describe the machine, not the process. `psu
 
 Reading the cgroup files directly is not enough either. The limit that applies is rarely written where the process is, and a cgroup that restricts nothing does not say so by leaving its limit file empty. A consumer that reads one file and takes it at face value believes it has 8 EB of memory.
 
-This package handles both, and reports only what actually restricts the process. `None` means nothing visible to the process restricts it, or a limit could not be read or used. `describe().notices` says which. The machine is then what is left to size from, and `get_machine_cpu_count()` and `get_machine_memory_bytes()` below give it.
+This package handles both, and reports only what actually restricts the process. `None` means no limit that counts is visible to the process, or a limit could not be read or used. `describe().notices` says which. The machine is then what is left to size from, and `get_machine_cpu_count()` and `get_machine_memory_bytes()` below give it.
 
 Off Linux and Windows every limit reads as `None`. macOS still reports the memory and the CPU cores of the machine. On other platforms the machine facts can read as `None`. Some examples below pair this package with `psutil`, which it does not require - `psutil` answers what the machine is using, which is not a question about limits.
 
@@ -26,7 +26,7 @@ In both mechanisms a limit sits on a level above the process: on Linux any cgrou
 
 A process does not sit in one cgroup. It sits in a chain of them: its own group, the group above that, and so on up to the root. A limit on [any level of that chain](https://docs.kernel.org/admin-guide/cgroup-v2.html) restricts the process, and the kernel enforces whichever level is tightest. That level is often not the group of the process. Under Kubernetes the limit usually sits on the pod cgroup rather than the container's, and the `kubepods` slice above them holds the memory the node is allowed to hand out at all. Under systemd a scope carries no CPU quota of its own while the slice above it does. This package therefore walks the whole chain.
 
-On cgroup v2 a level can hold two memory limits, `memory.max` and [`memory.high`](https://docs.kernel.org/admin-guide/cgroup-v2.html#memory-interface-files). The tighter of the two is the limit of that level.
+On cgroup v2 a level can hold two memory limits, `memory.max` and [`memory.high`](https://docs.kernel.org/admin-guide/cgroup-v2.html#memory-interface-files). `memory.high` counts only when the caller passes `throttle_limits=True` to `get_memory_budget()`, `snapshot()` or `describe()`. The tighter of the two is then the limit of that level.
 
 ### On Windows
 
@@ -179,7 +179,7 @@ Process affinity stays out too. `taskset` on Linux, and `SetProcessAffinityMask`
 
 `Source.levels` is the whole chain that was searched, not the levels that answered. Most levels on a chain hold no limit, which is normal - the chain is searched once and kept, because a limit can be written to any of them later. A job object is one level, named `job`. The chain is empty where the mechanism is present with nothing to search: a hierarchy binding no such controller, or a process in no job. The level a reading did come from is `memory_limit_level` or `cpu_limit_level`.
 
-A limit of `None` with no notice about it means nothing went wrong: the mechanism was there, and no level this process can see held a limit.
+A limit of `None` with no notice about it means nothing went wrong: the mechanism was there, and no level this process can see held a limit that counts.
 
 `Source.interface` is an `Interface` member - `CGROUP_V2`, `CGROUP_V1` or `WINDOWS_JOB_OBJECT` - and a notice carries a `NoticeCode`. Branch on those rather than on the strings they print as:
 
