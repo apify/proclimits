@@ -114,22 +114,22 @@ def test_rate_cap_reads_the_flags_before_the_union() -> None:
         pytest.param([0b11, 0b11], 4, id='two cores in each of two groups'),
         pytest.param([0, 0, 0b111], 3, id='groups the job uses none of still answer'),
         pytest.param([0xFF, 0xFF, 0xF], 20, id='every core of every group'),
-        pytest.param([0, 0], None, id='an affinity of no cores at all'),
-        pytest.param([], None, id='no groups answered'),
     ],
 )
-def test_affinity_cores(monkeypatch: pytest.MonkeyPatch, masks: list[int], expected: int | None) -> None:
+def test_read_cpu_counts_the_affinity_cores(monkeypatch: pytest.MonkeyPatch, masks: list[int], expected: int) -> None:
     """Counts the cores a job's affinity allows by summing its groups, which one mask cannot do."""
-    monkeypatch.setattr(_windows, '_group_affinity_masks', lambda: masks)
+    monkeypatch.setattr(
+        _windows,
+        '_query',
+        answering(_JOB_EXTENDED_LIMIT=extended_limits(flags=LIMIT_AFFINITY), _JOB_CPU_RATE_CONTROL=rate_control(0)),
+    )
+    monkeypatch.setattr(_windows, 'machine_cpu_count', lambda: 20)
+    monkeypatch.setattr(_windows, '_group_affinity_masks', lambda: (masks, 0))
 
-    assert _windows._affinity_cores() == expected
+    raw = _windows.read_cpu()
 
-
-def test_affinity_cores_when_the_groups_cannot_be_read(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Answers nothing where the call failed, which the caller reports as a restriction of unknown size."""
-    monkeypatch.setattr(_windows, '_group_affinity_masks', lambda: None)
-
-    assert _windows._affinity_cores() is None
+    assert raw.cpu_set is not None
+    assert raw.cpu_set.cores == expected
 
 
 def test_read_memory_without_a_job(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -144,12 +144,13 @@ def test_read_memory_without_a_job(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_read_memory_when_the_job_says_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Calls a job that will not answer unreadable, rather than unlimited."""
+    """Calls a job that will not answer unreadable, rather than unlimited, and names the query and the code."""
     monkeypatch.setattr(_windows, '_query', answering())
 
     raw = _windows.read_memory()
 
-    assert (raw.unreadable_level, raw.unlocated_file) == ('job', None)
+    expected = f'JobObjectExtendedLimitInformation (error {QUERY_FAILED})'
+    assert (raw.unreadable_file, raw.unlocated_file) == (expected, None)
 
 
 def test_read_memory_without_a_memory_limit(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -169,7 +170,7 @@ def test_read_memory_falls_back_to_the_distance(monkeypatch: pytest.MonkeyPatch)
         '_query',
         answering(_JOB_EXTENDED_LIMIT=extended_limits(flags=LIMIT_JOB_MEMORY, memory=512 * MIB)),
     )
-    monkeypatch.setattr(_windows, '_job_memory_in_use', lambda: 12 * MIB)
+    monkeypatch.setattr(_windows, '_job_memory_in_use', lambda: (12 * MIB, 0))
     monkeypatch.setattr(_windows, '_available_commit', lambda: None)
 
     raw = _windows.read_memory()
@@ -185,7 +186,7 @@ def test_read_memory_keeps_what_the_mechanism_answered(monkeypatch: pytest.Monke
         '_query',
         answering(_JOB_EXTENDED_LIMIT=extended_limits(flags=LIMIT_JOB_MEMORY, memory=512 * MIB)),
     )
-    monkeypatch.setattr(_windows, '_job_memory_in_use', lambda: 12 * MIB)
+    monkeypatch.setattr(_windows, '_job_memory_in_use', lambda: (12 * MIB, 0))
     monkeypatch.setattr(_windows, '_available_commit', lambda: 8 * MIB)
 
     assert _windows.read_memory().available == 8 * MIB
@@ -198,29 +199,42 @@ def test_read_memory_derives_the_usage_from_the_commit(monkeypatch: pytest.Monke
         '_query',
         answering(_JOB_EXTENDED_LIMIT=extended_limits(flags=LIMIT_JOB_MEMORY, memory=512 * MIB)),
     )
-    monkeypatch.setattr(_windows, '_job_memory_in_use', lambda: None)
+    monkeypatch.setattr(_windows, '_job_memory_in_use', lambda: (None, QUERY_FAILED))
     monkeypatch.setattr(_windows, '_available_commit', lambda: 500 * MIB)
 
     raw = _windows.read_memory()
 
     assert (raw.limit, raw.used, raw.available) == (512 * MIB, 12 * MIB, 500 * MIB)
+    # The commit answered for the usage, so the failed query is not named.
+    assert raw.usage_unreadable_file is None
 
 
 def test_read_memory_without_a_usage_figure(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keeps the limit and drops the pair where neither call answers with a figure to pair it with."""
+    """Charges the job nothing where neither call answers, and names the query and the code."""
     monkeypatch.setattr(
         _windows,
         '_query',
         answering(_JOB_EXTENDED_LIMIT=extended_limits(flags=LIMIT_JOB_MEMORY, memory=512 * MIB)),
     )
-    monkeypatch.setattr(_windows, '_job_memory_in_use', lambda: None)
     monkeypatch.setattr(_windows, '_available_commit', lambda: None)
 
     raw = _windows.read_memory()
 
-    assert (raw.limit, raw.used, raw.available) == (512 * MIB, None, None)
+    # A job is one level with nothing below it, so zero is the only bound there is.
+    assert (raw.limit, raw.used, raw.available) == (512 * MIB, 0, 512 * MIB)
     # Two calls failed, so this is a fault to look into rather than the shape of the job.
-    assert raw.usage_unreadable_level == 'job'
+    assert raw.usage_unreadable_file == f'JobObjectLimitViolationInformation (error {QUERY_FAILED})'
+
+
+def test_job_memory_in_use_reads_the_violation_class(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reads the charge of the job from the limit violation class, which answers with no violation having happened."""
+    violation = _windows._LimitViolation()
+    violation.JobMemory = 12 * MIB
+    # The limit sits beside the charge, so reading the wrong field shows.
+    violation.JobMemoryLimit = 512 * MIB
+    monkeypatch.setattr(_windows, '_query', answering(_JOB_LIMIT_VIOLATION=violation))
+
+    assert _windows._job_memory_in_use() == (12 * MIB, 0)
 
 
 def test_read_memory_with_only_a_per_process_limit(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -236,7 +250,7 @@ def test_read_memory_with_only_a_per_process_limit(monkeypatch: pytest.MonkeyPat
     assert (raw.limit, raw.used, raw.available) == (256 * MIB, None, None)
     assert raw.limit_level == 'job'
     # No call failed: a per-process limit is a shape the job pairs no usage figure with.
-    assert raw.usage_unreadable_level is None
+    assert raw.usage_unreadable_file is None
     assert raw.unlocated_file is None
 
 
@@ -251,7 +265,7 @@ def test_read_memory_prefers_a_tighter_per_process_limit(monkeypatch: pytest.Mon
             )
         ),
     )
-    monkeypatch.setattr(_windows, '_job_memory_in_use', lambda: 12 * MIB)
+    monkeypatch.setattr(_windows, '_job_memory_in_use', lambda: (12 * MIB, 0))
     monkeypatch.setattr(_windows, '_available_commit', lambda: 500 * MIB)
 
     raw = _windows.read_memory()
@@ -272,7 +286,7 @@ def test_read_memory_keeps_the_job_limit_when_it_is_tighter(monkeypatch: pytest.
             )
         ),
     )
-    monkeypatch.setattr(_windows, '_job_memory_in_use', lambda: 12 * MIB)
+    monkeypatch.setattr(_windows, '_job_memory_in_use', lambda: (12 * MIB, 0))
     monkeypatch.setattr(_windows, '_available_commit', lambda: 200 * MIB)
 
     raw = _windows.read_memory()
@@ -286,7 +300,7 @@ def test_read_cpu_without_a_job(monkeypatch: pytest.MonkeyPatch) -> None:
 
     raw = _windows.read_cpu()
 
-    assert (raw.quota, raw.cpu_set, raw.unreadable_level, raw.unlocated_file) == (None, None, None, None)
+    assert (raw.quota, raw.cpu_set, raw.unreadable_file, raw.unlocated_file) == (None, None, None, None)
 
 
 def test_read_cpu_when_the_job_says_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -295,7 +309,8 @@ def test_read_cpu_when_the_job_says_nothing(monkeypatch: pytest.MonkeyPatch) -> 
 
     raw = _windows.read_cpu()
 
-    assert (raw.unreadable_level, raw.unlocated_file) == ('job', None)
+    expected = f'JobObjectExtendedLimitInformation (error {QUERY_FAILED})'
+    assert (raw.unreadable_file, raw.unlocated_file) == (expected, None)
 
 
 def test_read_cpu_takes_both_restrictions(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -309,7 +324,7 @@ def test_read_cpu_takes_both_restrictions(monkeypatch: pytest.MonkeyPatch) -> No
         ),
     )
     monkeypatch.setattr(_windows, 'machine_cpu_count', lambda: 20)
-    monkeypatch.setattr(_windows, '_group_affinity_masks', lambda: [0b111])
+    monkeypatch.setattr(_windows, '_group_affinity_masks', lambda: ([0b111], 0))
 
     raw = _windows.read_cpu()
 
@@ -331,12 +346,12 @@ def test_read_cpu_without_the_machine_cores(monkeypatch: pytest.MonkeyPatch) -> 
         ),
     )
     monkeypatch.setattr(_windows, 'machine_cpu_count', lambda: None)
-    monkeypatch.setattr(_windows, '_group_affinity_masks', lambda: [0b111])
+    monkeypatch.setattr(_windows, '_group_affinity_masks', lambda: ([0b111], 0))
 
     raw = _windows.read_cpu()
 
     assert raw.unconvertible_level == 'job'
-    assert (raw.quota, raw.cpu_set, raw.unreadable_level, raw.unlocated_file) == (None, None, None, None)
+    assert (raw.quota, raw.cpu_set, raw.unreadable_file, raw.unlocated_file) == (None, None, None, None)
 
 
 def test_read_cpu_keeps_an_affinity_without_the_machine_cores(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -350,7 +365,7 @@ def test_read_cpu_keeps_an_affinity_without_the_machine_cores(monkeypatch: pytes
         ),
     )
     monkeypatch.setattr(_windows, 'machine_cpu_count', lambda: None)
-    monkeypatch.setattr(_windows, '_group_affinity_masks', lambda: [0b111])
+    monkeypatch.setattr(_windows, '_group_affinity_masks', lambda: ([0b111], 0))
 
     raw = _windows.read_cpu()
 
@@ -369,7 +384,8 @@ def test_read_cpu_when_only_the_rate_control_is_silent(monkeypatch: pytest.Monke
 
     raw = _windows.read_cpu()
 
-    assert (raw.quota, raw.cpu_set, raw.unreadable_level, raw.unlocated_file) == (None, None, 'job', None)
+    expected = f'JobObjectCpuRateControlInformation (error {QUERY_FAILED})'
+    assert (raw.quota, raw.cpu_set, raw.unreadable_file, raw.unlocated_file) == (None, None, expected, None)
 
 
 def test_machine_cpu_count_falls_back_on_one_group(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -395,22 +411,45 @@ def test_machine_cpu_count_refuses_the_fallback_across_groups(monkeypatch: pytes
     assert _windows.machine_cpu_count() is None
 
 
-def test_read_cpu_when_the_affinity_cannot_be_counted(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Calls a job holding an affinity it will not detail unreadable, rather than unrestricted."""
+@pytest.mark.parametrize(
+    ('answer', 'reason'),
+    [
+        pytest.param((None, QUERY_FAILED), f'error {QUERY_FAILED}', id='the query failed'),
+        pytest.param(([0, 0], 0), 'counts no core', id='an affinity of no cores at all'),
+        pytest.param(([], 0), 'counts no core', id='no groups answered'),
+    ],
+)
+def test_read_cpu_when_the_affinity_cannot_be_counted(
+    monkeypatch: pytest.MonkeyPatch, answer: tuple[list[int] | None, int], reason: str
+) -> None:
+    """Calls a job holding an affinity it will not count unreadable, rather than unrestricted, and says why."""
     monkeypatch.setattr(
         _windows,
         '_query',
         answering(
             _JOB_EXTENDED_LIMIT=extended_limits(flags=LIMIT_AFFINITY, affinity=0b111),
-            _JOB_CPU_RATE_CONTROL=rate_control(0),
+            _JOB_CPU_RATE_CONTROL=rate_control(ENABLE | HARD_CAP, cpu_rate=750),
         ),
     )
     monkeypatch.setattr(_windows, 'machine_cpu_count', lambda: 20)
-    monkeypatch.setattr(_windows, '_group_affinity_masks', lambda: None)
+    monkeypatch.setattr(_windows, '_group_affinity_masks', lambda: answer)
 
     raw = _windows.read_cpu()
 
-    assert (raw.quota, raw.cpu_set, raw.unreadable_level, raw.unlocated_file) == (None, None, 'job', None)
+    expected = f'JobObjectGroupInformationEx ({reason})'
+    assert (raw.quota, raw.cpu_set, raw.unreadable_file, raw.unlocated_file) == (None, None, expected, None)
+
+
+def test_group_affinity_masks_carry_the_code_the_query_failed_with(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hands back the code a failed affinity query left, which the notice names."""
+
+    def fail(*_args: Any) -> int:
+        ctypes.set_last_error(QUERY_FAILED)
+        return 0
+
+    monkeypatch.setattr(_windows._kernel32, 'QueryInformationJobObject', fail)
+
+    assert _windows._group_affinity_masks() == (None, QUERY_FAILED)
 
 
 def test_read_cpu_ignores_the_single_group_mask(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -426,7 +465,7 @@ def test_read_cpu_ignores_the_single_group_mask(monkeypatch: pytest.MonkeyPatch)
         ),
     )
     monkeypatch.setattr(_windows, 'machine_cpu_count', lambda: 20)
-    monkeypatch.setattr(_windows, '_group_affinity_masks', lambda: [0b11, 0b11])
+    monkeypatch.setattr(_windows, '_group_affinity_masks', lambda: ([0b11, 0b11], 0))
 
     raw = _windows.read_cpu()
 
