@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import threading
 import time
@@ -31,6 +32,12 @@ threshold, past which the kernel starts writing at once.
 WRITE_CHUNK_BYTES = 1024 * 1024
 """How much is written per call, so the burst needs no buffer the size of itself."""
 
+THROTTLE_LIMITS = os.environ.get('PROBE_THROTTLE_LIMITS') == '1'
+"""Whether every reading passes `throttle_limits=True`. Set from the environment, so a container can carry it.
+
+The name must match `harness.THROTTLE_LIMITS_ENV`. The probe runs alone in a container and cannot import it.
+"""
+
 
 def burn(seconds: float) -> None:
     """Keep one core busy for a while.
@@ -50,7 +57,7 @@ def source(value: proclimits.Source | None) -> dict[str, Any] | None:
 
 def charged() -> tuple[int | None, int | None]:
     """Read the memory charged against the limit and the pages waiting to reach the disk."""
-    description = proclimits.describe()
+    description = proclimits.describe(throttle_limits=THROTTLE_LIMITS)
     budget = description.memory_budget
 
     return budget.used if budget is not None else None, description.raw_memory_unflushed_cache
@@ -75,14 +82,14 @@ def main() -> None:
     # Kept alive until everything has been read. `bytearray` zero-fills, so every page is really charged.
     ballast = bytearray(ALLOCATION_BYTES)
 
-    reading = proclimits.snapshot()
+    reading = proclimits.snapshot(throttle_limits=THROTTLE_LIMITS)
 
     burner = threading.Thread(target=burn, args=(MEASUREMENT_SECONDS,), daemon=True)
     burner.start()
     cpu_used_ratio = proclimits.get_cpu_used_ratio(MEASUREMENT_SECONDS)
     burner.join()
 
-    description = proclimits.describe()
+    description = proclimits.describe(throttle_limits=THROTTLE_LIMITS)
 
     # Last of all, so no reading above sees pages this process left waiting to be written.
     used_before: int | None = None

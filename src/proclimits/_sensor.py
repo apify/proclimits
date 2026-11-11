@@ -23,7 +23,7 @@ class MemoryBudget:
     """
 
     limit: int
-    """The tightest limit in bytes. Always below `describe().memory_limit_ceiling`.
+    """The tightest limit in bytes. Always below `describe().memory_limit_ceiling`. It can be 0.
 
     A Windows job limits commit, so that ceiling - and this limit with it - can stand above the memory of the
     machine. Taking the smaller of this and `machine_memory_bytes` there sizes from a limit that does not
@@ -61,6 +61,8 @@ class MemoryBudget:
 
         Of the limit, not of this process: where the limit belongs to a level above, everything else under
         that level is charged against it too.
+
+        A limit of 0 gives 1.0.
         """
         return self.used / self.limit if self.limit > 0 else 1.0
 
@@ -94,15 +96,18 @@ class Description:
     This is the diagnostic counterpart of `snapshot()`, and it carries the readings themselves, so that one
     dump answers what was reported as well as why.
 
-    A limit of `None` next to no notice about it means the mechanism was there and nothing limited this
-    process in a way that kills it. Only hard limits are read.
+    A limit of `None` next to no notice about it means the mechanism was there and no level this process can see
+    held a limit that counts. A `memory.high` counts only with `throttle_limits=True`.
 
     The sources are located after the readings, so beside a `*_METRICS_UNREADABLE` notice they can show what a
     later lookup found.
     """
 
     memory_budget: MemoryBudget | None
-    """What `get_memory_budget()` reports, taken at the same moment as everything below."""
+    """What `get_memory_budget()` reports, taken at the same moment as everything below.
+
+    It counts `memory.high` under the same `throttle_limits` that `describe()` was given.
+    """
 
     cpu_limit: float | None
     """What `get_cpu_limit()` reports, taken at the same moment as everything below."""
@@ -210,7 +215,7 @@ class Description:
     """What is worth knowing about a reading, or about the mechanism. Empty when there is nothing to say."""
 
 
-def get_memory_budget() -> MemoryBudget | None:
+def get_memory_budget(*, throttle_limits: bool = False) -> MemoryBudget | None:
     """Get the memory budget that actually restricts this process.
 
     A limit that reaches the ceiling the mechanism judges it against is not reported. That is how an
@@ -218,10 +223,14 @@ def get_memory_budget() -> MemoryBudget | None:
     when no usage metric can be paired with it. `describe()` explains every rejection, and carries the ceiling
     as `memory_limit_ceiling`.
 
+    Args:
+        throttle_limits: Whether to count `memory.high` as a limit beside `memory.max` under cgroup v2. The
+            default leaves it out.
+
     Returns:
         The budget, or `None` where none is reported.
     """
-    return _evaluate_memory(_backend.memory_limit_ceiling()).effective
+    return _evaluate_memory(_backend.memory_limit_ceiling(), throttle_limits=throttle_limits).effective
 
 
 def get_cpu_limit() -> float | None:
@@ -315,26 +324,34 @@ async def get_cpu_used_ratio_async(interval: float = 1.0) -> float | None:
     return _used_ratio(start, end) if end is not None else None
 
 
-def snapshot() -> Snapshot:
+def snapshot(*, throttle_limits: bool = False) -> Snapshot:
     """Take every reading at once.
+
+    Args:
+        throttle_limits: Whether to count `memory.high` as a limit beside `memory.max` under cgroup v2. The
+            default leaves it out.
 
     Returns:
         The memory budget, the CPU limit and the CPU usage counter. The rate is not included - it needs a
         measurement window.
     """
     return Snapshot(
-        memory_budget=get_memory_budget(),
+        memory_budget=get_memory_budget(throttle_limits=throttle_limits),
         cpu_limit=get_cpu_limit(),
         cpu_usage=get_cpu_usage(),
     )
 
 
-def describe() -> Description:
+def describe(*, throttle_limits: bool = False) -> Description:
     """Explain how the sensor arrives at its readings.
 
     Every reading is taken again, so a limit changed between two calls shows up here. Where the readings come
     from was discovered once - `clear_cache()` is what forgets that. A lookup that cannot read `/proc` is not
     kept.
+
+    Args:
+        throttle_limits: Whether to count `memory.high` as a limit beside `memory.max` under cgroup v2. The
+            default leaves it out. Pass the same value as the reading this explains.
 
     Returns:
         The readings, the source of each metric, the raw values before filtering, the machine facts, and a
@@ -345,7 +362,7 @@ def describe() -> Description:
     machine_memory = get_machine_memory_bytes()
     machine_cpus = get_machine_cpu_count()
     ceiling = _backend.memory_limit_ceiling()
-    memory = _evaluate_memory(ceiling)
+    memory = _evaluate_memory(ceiling, throttle_limits=throttle_limits)
     cpu = _evaluate_cpu_limit(machine_cpus)
 
     # After the readings: a lookup that succeeded is kept, so a limit read above has its source here.
@@ -562,17 +579,17 @@ class _CpuEvaluation:
     """What is worth knowing about a reading, or about the mechanism. Empty when there is nothing to say."""
 
 
-def _evaluate_memory(ceiling: int | None) -> _MemoryEvaluation:
+def _evaluate_memory(ceiling: int | None, *, throttle_limits: bool) -> _MemoryEvaluation:
     """Judge the raw memory reading against the size at which a limit stops restricting."""
-    raw = _backend.read_memory()
+    raw = _backend.read_memory(throttle_limits=throttle_limits)
     rejection = _memory_rejection(raw, ceiling)
 
     if rejection is not None:
         return _MemoryEvaluation(effective=None, raw=raw, notices=(rejection,))
 
     if raw.limit is None or raw.used is None or raw.available is None:
-        # Nothing to report and nothing to explain: the mechanism is there and no level limits anything. The
-        # last two tests never decide this branch, and stay only to narrow the type below.
+        # Nothing to report and nothing to explain: the mechanism is there and no level holds a limit that counts.
+        # The last two tests never decide this branch, and stay only to narrow the type below.
         return _MemoryEvaluation(effective=None, raw=raw, notices=())
 
     return _MemoryEvaluation(effective=_reconcile(raw.limit, raw.used, raw.available), raw=raw, notices=())
@@ -581,7 +598,7 @@ def _evaluate_memory(ceiling: int | None) -> _MemoryEvaluation:
 def _reconcile(limit: int, used: int, available: int) -> MemoryBudget:
     """Bring three numbers a mechanism may have read separately into one pair a consumer can use."""
     # The memory in use first, so the distance below it is already a number that can be allocated. The room
-    # gives way rather than the usage: one left too high promises memory the kernel will refuse.
+    # gives way rather than the usage: one left too high promises memory past the limit.
     charged = min(max(used, 0), limit)
 
     return MemoryBudget(limit=limit, used=charged, available=min(max(available, 0), limit - charged))
@@ -813,8 +830,9 @@ def get_machine_memory_bytes() -> int | None:
     `get_memory_budget()` has the other half of the answer here. A limit is compared against
     `describe().memory_limit_ceiling` instead.
 
-    A runtime that virtualizes this number (lxcfs) makes it equal the limit, which is then reported as no
-    restriction.
+    A runtime that virtualizes this number (lxcfs) makes it equal the tightest `memory.max` on the chain, or
+    `memory.limit_in_bytes` under cgroup v1. That limit is then reported as no restriction.
+    `get_memory_budget(throttle_limits=True)` reports a tighter `memory.high` as the limit.
 
     Returns:
         The total memory, or `None` when it cannot be read.

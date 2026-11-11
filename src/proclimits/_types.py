@@ -7,8 +7,8 @@ from enum import Enum
 class NoticeCode(str, Enum):
     """Why a reading was dropped, why a rate cannot be measured, or what the mechanism cannot see.
 
-    Most accompany a reading that was dropped. The `*_ANCESTORS_HIDDEN` pair reports a hierarchy this process
-    can read only part of. It follows from what the mechanism exposes rather than from a reading, so it
+    Most accompany a reading that was dropped. The `*_ANCESTORS_HIDDEN` pair reports a mount that exposes only a
+    subtree of a hierarchy. It follows from what the mechanism exposes rather than from a reading, so it
     appears whether or not one was made, and what was read may be looser than what applies.
 
     Compare against these rather than against the strings they carry: the strings are what a log line shows,

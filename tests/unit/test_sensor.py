@@ -115,6 +115,31 @@ def test_get_memory_budget_restricted(fake_cgroup: Callable[..., Path]) -> None:
     assert notice_codes('memory') == ()
 
 
+def test_throttle_limits_counts_memory_high(fake_cgroup: Callable[..., Path]) -> None:
+    """Counts a tighter `memory.high` in every call that takes `throttle_limits=True`, and in none by default."""
+    fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/'),
+        files={
+            'memory.max': '1073741824\n',
+            'memory.high': '536870912\n',
+            'memory.current': '150000000\n',
+            'memory.stat': 'inactive_file 50000000\n',
+        },
+    )
+    hard = proclimits.MemoryBudget(limit=1073741824, used=100000000, available=973741824)
+    throttle = proclimits.MemoryBudget(limit=536870912, used=100000000, available=436870912)
+
+    assert proclimits.get_memory_budget() == hard
+    assert proclimits.snapshot().memory_budget == hard
+    assert proclimits.describe().memory_budget == hard
+    assert proclimits.get_memory_budget(throttle_limits=True) == throttle
+    assert proclimits.snapshot(throttle_limits=True).memory_budget == throttle
+    assert proclimits.describe(throttle_limits=True).memory_budget == throttle
+    # No notice says a tighter `memory.high` was left out.
+    assert notice_codes('memory') == ()
+
+
 def test_get_memory_budget_above_the_machine_below_the_ceiling(
     fake_cgroup: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
@@ -205,7 +230,7 @@ def test_get_memory_budget_usage_the_mechanism_does_not_offer(monkeypatch: pytes
         usage_unreadable_level=None,
         unlocated_file=None,
     )
-    monkeypatch.setattr(_backend, 'read_memory', lambda: raw)
+    monkeypatch.setattr(_backend, 'read_memory', lambda **_: raw)
 
     assert proclimits.get_memory_budget() is None
     assert notice_codes('memory') == ('memory-usage-unavailable',)
@@ -223,7 +248,7 @@ def test_get_memory_budget_brings_a_disagreeing_triple_into_range(monkeypatch: p
         usage_unreadable_level=None,
         unlocated_file=None,
     )
-    monkeypatch.setattr(_backend, 'read_memory', lambda: raw)
+    monkeypatch.setattr(_backend, 'read_memory', lambda **_: raw)
 
     budget = proclimits.get_memory_budget()
 
@@ -244,7 +269,7 @@ def test_get_memory_budget_keeps_a_room_the_mechanism_made_smaller(monkeypatch: 
         usage_unreadable_level=None,
         unlocated_file=None,
     )
-    monkeypatch.setattr(_backend, 'read_memory', lambda: raw)
+    monkeypatch.setattr(_backend, 'read_memory', lambda **_: raw)
 
     assert proclimits.get_memory_budget() == proclimits.MemoryBudget(limit=1000, used=250, available=100)
 
@@ -1220,8 +1245,8 @@ def test_a_cache_cleared_after_a_reading_is_not_a_missing_mechanism(
     )
     read = getattr(_backend, reading)
 
-    def read_then_clear() -> _types.RawMemory | _types.RawCpu:
-        raw = read()
+    def read_then_clear(**flags: bool) -> _types.RawMemory | _types.RawCpu:
+        raw = read(**flags)
         # Another thread forgets the discovery here, and the next `/proc` read fails.
         _cgroup.clear_cache()
         fail_the_first_lookup(monkeypatch)
