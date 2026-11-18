@@ -244,9 +244,9 @@ def get_cpu_limit() -> float | None:
     """Get the number of CPU cores this process may actually use.
 
     A bandwidth quota and a CPU set restrict the CPU independently. The tighter one wins. A reading that covers
-    the whole machine is ignored. A limit that cannot be read is left out. On Windows a CPU control that will not
-    answer drops both restrictions. Process affinity (`taskset`, `SetProcessAffinityMask`) is out of scope - it
-    narrows one process, not its group. `describe()` shows the readings separately.
+    the whole machine is ignored. A limit that cannot be read is left out. Process affinity (`taskset`,
+    `SetProcessAffinityMask`) is out of scope - it narrows one process, not its group. `describe()` shows the
+    readings separately.
 
     Returns:
         The number of cores, possibly fractional. `None` where no limit is reported.
@@ -589,7 +589,7 @@ class _CpuEvaluation:
 
 def _evaluate_memory(ceiling: int | None, *, throttle_limits: bool) -> _MemoryEvaluation:
     """Judge the raw memory reading against the size at which a limit stops restricting."""
-    raw = _backend.read_memory(throttle_limits=throttle_limits, ceiling=ceiling)
+    raw = _backend.read_memory(throttle_limits=throttle_limits)
     notices = []
 
     if raw.unreadable_file is not None:
@@ -604,17 +604,23 @@ def _evaluate_memory(ceiling: int | None, *, throttle_limits: bool) -> _MemoryEv
     if rejection is not None:
         return _MemoryEvaluation(effective=None, raw=raw, notices=(*notices, rejection))
 
-    if raw.limit is None or raw.used is None or raw.available is None:
+    if raw.limit is None or ceiling is None or raw.used is None or raw.available is None:
         # Nothing to report: no level holds a limit that counts and can be read. A limit left out is named above.
-        # The last two tests never decide this branch, and stay only to narrow the type below.
+        # The last three tests never decide this branch, and stay only to narrow the types below.
         return _MemoryEvaluation(effective=None, raw=raw, notices=tuple(notices))
 
-    # Only beside a budget that is reported. A budget dropped for another reason has no bounds to qualify.
-    if raw.usage_unreadable_file is not None:
+    # Only beside a budget that is reported. A budget dropped for another reason has no bounds to qualify. The
+    # closest level is named. A limit that reaches the ceiling restricts nothing, so its level is named only where
+    # it set the room.
+    unreadable_usage = next(
+        (usage for usage in raw.unreadable_usages if usage.limit < ceiling or usage.set_available),
+        None,
+    )
+    if unreadable_usage is not None:
         notices.append(
             Notice(
                 code=NoticeCode.MEMORY_USAGE_UNREADABLE,
-                message=f'The memory usage in {raw.usage_unreadable_file} cannot be read. The used memory reported '
+                message=f'The memory usage in {unreadable_usage.file} cannot be read. The used memory reported '
                 'is a lower bound, and the available memory an upper bound.',
             )
         )
@@ -668,19 +674,6 @@ def _memory_rejection(raw: RawMemory, ceiling: int | None) -> Notice | None:
 def _evaluate_cpu_limit(machine_cpus: int | None) -> _CpuEvaluation:
     """Judge the raw CPU readings. The tighter of the quota and the set wins."""
     raw = _backend.read_cpu()
-
-    if raw.unconvertible_level is not None:
-        # The other reading is dropped with it, because the share that cannot be sized may be the tighter of the
-        # two. A cgroup limit that cannot be read is left out instead, as one on a hidden level is.
-        return _no_cpu_limit(
-            Notice(
-                code=NoticeCode.MACHINE_CPU_COUNT_UNKNOWN,
-                message=f'The CPU limit of {raw.unconvertible_level} is a share of the machine, and the cores '
-                'of the machine cannot be read. A share says nothing about cores on its own, so nothing is '
-                'reported.',
-            )
-        )
-
     quota, cpu_set = raw.quota, raw.cpu_set
 
     restrictions = []
@@ -707,6 +700,17 @@ def _evaluate_cpu_limit(machine_cpus: int | None) -> _CpuEvaluation:
 
     notices = []
     candidates = []
+
+    if raw.unconvertible_level is not None:
+        # A share that cannot be sized is left out, as a limit that cannot be read is.
+        notices.append(
+            Notice(
+                code=NoticeCode.MACHINE_CPU_COUNT_UNKNOWN,
+                message=f'The CPU limit of {raw.unconvertible_level} is a share of the machine, and the cores '
+                'of the machine cannot be read. A share says nothing about cores on its own, '
+                f'{_left_out(read_any=bool(restrictions))}',
+            )
+        )
 
     if raw.unreadable_file is not None:
         notices.append(
@@ -759,23 +763,14 @@ def _evaluate_cpu_limit(machine_cpus: int | None) -> _CpuEvaluation:
 
 def _unreadable_limit_notice(code: NoticeCode, metric: str, unreadable_file: str, *, read_any: bool) -> Notice:
     """Name a limit left out of a raw reading, and say whether another one was read in its place."""
-    consequence = (
-        'so it is left out. A tighter limit than the one read may apply.' if read_any else 'so nothing is reported.'
+    return Notice(
+        code=code, message=f'The {metric} limit in {unreadable_file} cannot be read, {_left_out(read_any=read_any)}'
     )
 
-    return Notice(code=code, message=f'The {metric} limit in {unreadable_file} cannot be read, {consequence}')
 
-
-def _no_cpu_limit(notice: Notice) -> _CpuEvaluation:
-    """Report no CPU limit at all, with one notice saying why."""
-    return _CpuEvaluation(
-        effective=None,
-        limit_level=None,
-        usage_level=None,
-        raw_quota=None,
-        raw_set_size=None,
-        notices=(notice,),
-    )
+def _left_out(*, read_any: bool) -> str:
+    """Say what leaving a limit out means: another one read may be looser, or nothing is left to report."""
+    return 'so it is left out. A tighter limit than the one read may apply.' if read_any else 'so nothing is reported.'
 
 
 def _missing_memory_mechanism(raw: RawMemory) -> Notice | None:

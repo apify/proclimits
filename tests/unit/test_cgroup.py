@@ -193,7 +193,7 @@ def test_read_hierarchies_no_unified_when_no_mount_covers(fake_cgroup: Callable[
         unflushed_cache=None,
         limit_level=None,
         unreadable_file=None,
-        usage_unreadable_file=None,
+        unreadable_usages=(),
         unlocated_file=None,
     )
 
@@ -221,7 +221,7 @@ def test_read_hierarchies_v1_answers_when_no_cgroup2_mount_covers(fake_cgroup: C
         unflushed_cache=None,
         limit_level=str(root / 'memory'),
         unreadable_file=None,
-        usage_unreadable_file=None,
+        unreadable_usages=(),
         unlocated_file=None,
     )
 
@@ -457,7 +457,7 @@ def test_read_memory_names_a_failed_lookup(
         unflushed_cache=None,
         limit_level=None,
         unreadable_file=None,
-        usage_unreadable_file=None,
+        unreadable_usages=(),
         unlocated_file=f'{path} (EMFILE)',
     )
     assert cgroup.read_memory() == cgroup.RawMemory(
@@ -467,7 +467,7 @@ def test_read_memory_names_a_failed_lookup(
         unflushed_cache=None,
         limit_level=str(root),
         unreadable_file=None,
-        usage_unreadable_file=None,
+        unreadable_usages=(),
         unlocated_file=None,
     )
 
@@ -708,7 +708,7 @@ def test_read_memory_does_not_open_memory_high_by_default(fake_cgroup: Callable[
         unflushed_cache=None,
         limit_level=str(root),
         unreadable_file=None,
-        usage_unreadable_file=None,
+        unreadable_usages=(),
         unlocated_file=None,
     )
     # Once asked for, the same file is left out and named.
@@ -768,7 +768,7 @@ def test_read_memory_tightest_level(fake_cgroup: Callable[..., Path]) -> None:
         unflushed_cache=None,
         limit_level=str(root / 'kubepods' / 'pod' / 'container'),
         unreadable_file=None,
-        usage_unreadable_file=None,
+        unreadable_usages=(),
         unlocated_file=None,
     )
 
@@ -800,7 +800,7 @@ def test_read_memory_when_the_tightest_limit_is_not_the_closest(fake_cgroup: Cal
         unflushed_cache=None,
         limit_level=str(root / 'pod' / 'container'),
         unreadable_file=None,
-        usage_unreadable_file=None,
+        unreadable_usages=(),
         unlocated_file=None,
     )
 
@@ -830,7 +830,7 @@ def test_read_memory_tighter_ancestor(fake_cgroup: Callable[..., Path]) -> None:
         unflushed_cache=None,
         limit_level=str(root / 'kubepods'),
         unreadable_file=None,
-        usage_unreadable_file=None,
+        unreadable_usages=(),
         unlocated_file=None,
     )
 
@@ -860,7 +860,7 @@ def test_read_memory_smallest_distance(fake_cgroup: Callable[..., Path]) -> None
         unflushed_cache=None,
         limit_level=str(root / 'kubepods' / 'pod'),
         unreadable_file=None,
-        usage_unreadable_file=None,
+        unreadable_usages=(),
         unlocated_file=None,
     )
 
@@ -889,7 +889,13 @@ def test_read_memory_partial_level(fake_cgroup: Callable[..., Path]) -> None:
         unflushed_cache=None,
         limit_level=str(root / 'kubepods' / 'pod' / 'container'),
         unreadable_file=None,
-        usage_unreadable_file=f'{root / "kubepods" / "pod" / "container" / "memory.stat"} (has no inactive_file)',
+        unreadable_usages=(
+            cgroup.UnreadableUsage(
+                file=f'{root / "kubepods" / "pod" / "container" / "memory.stat"} (has no inactive_file)',
+                limit=1000,
+                set_available=True,
+            ),
+        ),
         unlocated_file=None,
     )
 
@@ -946,7 +952,7 @@ def test_read_memory_usage_above_the_limit(fake_cgroup: Callable[..., Path]) -> 
         unflushed_cache=None,
         limit_level=str(root),
         unreadable_file=None,
-        usage_unreadable_file=None,
+        unreadable_usages=(),
         unlocated_file=None,
     )
 
@@ -978,7 +984,11 @@ def test_read_memory_ancestor_without_usage_files(fake_cgroup: Callable[..., Pat
         unflushed_cache=None,
         limit_level=str(root / 'pod'),
         unreadable_file=None,
-        usage_unreadable_file=f'{root / "pod" / "memory.current"} ({OPENING_A_DIRECTORY})',
+        unreadable_usages=(
+            cgroup.UnreadableUsage(
+                file=f'{root / "pod" / "memory.current"} ({OPENING_A_DIRECTORY})', limit=500, set_available=True
+            ),
+        ),
         unlocated_file=None,
     )
 
@@ -998,7 +1008,11 @@ def test_read_memory_no_used(fake_cgroup: Callable[..., Path]) -> None:
         unflushed_cache=None,
         limit_level=str(root),
         unreadable_file=None,
-        usage_unreadable_file=f'{root / "memory.stat"} (has no inactive_file)',
+        unreadable_usages=(
+            cgroup.UnreadableUsage(
+                file=f'{root / "memory.stat"} (has no inactive_file)', limit=536870912, set_available=True
+            ),
+        ),
         unlocated_file=None,
     )
 
@@ -1024,7 +1038,7 @@ def test_read_memory_missing_files(fake_cgroup: Callable[..., Path]) -> None:
         unflushed_cache=None,
         limit_level=str(root / 'pod'),
         unreadable_file=None,
-        usage_unreadable_file=None,
+        unreadable_usages=(),
         unlocated_file=None,
     )
 
@@ -1434,7 +1448,7 @@ def test_read_memory_unreadable_limit(
         unflushed_cache=None,
         limit_level=str(root / level),
         unreadable_file=f'{root / "pod" / "container" / unreadable} (holds no number)',
-        usage_unreadable_file=None,
+        unreadable_usages=(),
         unlocated_file=None,
     )
 
@@ -1456,16 +1470,20 @@ def test_read_memory_looser_level_without_usage(fake_cgroup: Callable[..., Path]
     )
     (root / 'pod' / 'memory.current').mkdir()
 
-    # The pod is charged at least the 100 of the container, which leaves it 900 against the container's 400. Its
-    # limit is below the ceiling, so its usage is named though it does not set the room.
-    assert cgroup.read_memory(ceiling=16 * 1024**3) == cgroup.RawMemory(
+    # The pod is charged at least the 100 of the container, which leaves it 900 against the container's 400. So it
+    # is listed, and does not set the room.
+    assert cgroup.read_memory() == cgroup.RawMemory(
         limit=500,
         used=100,
         available=400,
         unflushed_cache=None,
         limit_level=str(root / 'pod' / 'container'),
         unreadable_file=None,
-        usage_unreadable_file=f'{root / "pod" / "memory.current"} ({OPENING_A_DIRECTORY})',
+        unreadable_usages=(
+            cgroup.UnreadableUsage(
+                file=f'{root / "pod" / "memory.current"} ({OPENING_A_DIRECTORY})', limit=1000, set_available=False
+            ),
+        ),
         unlocated_file=None,
     )
 
@@ -1678,7 +1696,7 @@ def test_locate_controllers_hybrid(fake_cgroup: Callable[..., Path]) -> None:
         unflushed_cache=None,
         limit_level=str(root / 'memory'),
         unreadable_file=None,
-        usage_unreadable_file=None,
+        unreadable_usages=(),
         unlocated_file=None,
     )
 
@@ -1693,7 +1711,7 @@ def test_no_cgroups() -> None:
         unflushed_cache=None,
         limit_level=None,
         unreadable_file=None,
-        usage_unreadable_file=None,
+        unreadable_usages=(),
         unlocated_file=None,
     )
     # An absent `/proc` is a fact about the system rather than a failed lookup, so no file is named.
@@ -1737,7 +1755,7 @@ def test_locate_controllers_with_unreadable_directories(
         unflushed_cache=None,
         limit_level=None,
         unreadable_file=None,
-        usage_unreadable_file=None,
+        unreadable_usages=(),
         unlocated_file=None,
     )
 
@@ -1886,7 +1904,7 @@ def test_read_memory_limit_of_zero(fake_cgroup: Callable[..., Path]) -> None:
         unflushed_cache=None,
         limit_level=str(root / 'pod' / 'container'),
         unreadable_file=None,
-        usage_unreadable_file=None,
+        unreadable_usages=(),
         unlocated_file=None,
     )
 
@@ -1913,7 +1931,7 @@ def test_read_memory_usage_below_the_cache(fake_cgroup: Callable[..., Path]) -> 
         unflushed_cache=None,
         limit_level=str(root),
         unreadable_file=None,
-        usage_unreadable_file=None,
+        unreadable_usages=(),
         unlocated_file=None,
     )
 
@@ -2021,7 +2039,7 @@ def test_read_hierarchies_skips_a_foreign_v1_mount(fake_cgroup: Callable[..., Pa
         unflushed_cache=None,
         limit_level=str(root / 'ours' / 'mine'),
         unreadable_file=None,
-        usage_unreadable_file=None,
+        unreadable_usages=(),
         unlocated_file=None,
     )
 
@@ -2045,7 +2063,7 @@ def test_read_memory_v1_uses_the_hierarchical_key(fake_cgroup: Callable[..., Pat
         unflushed_cache=None,
         limit_level=str(root / 'memory'),
         unreadable_file=None,
-        usage_unreadable_file=None,
+        unreadable_usages=(),
         unlocated_file=None,
     )
 
@@ -2163,7 +2181,7 @@ def test_read_memory_dirty_cache_is_not_credited(fake_cgroup: Callable[..., Path
         unflushed_cache=300,
         limit_level=str(root),
         unreadable_file=None,
-        usage_unreadable_file=None,
+        unreadable_usages=(),
         unlocated_file=None,
     )
 
@@ -2191,7 +2209,7 @@ def test_read_memory_dirty_cache_is_not_credited_v1(fake_cgroup: Callable[..., P
         unflushed_cache=300,
         limit_level=str(root / 'memory'),
         unreadable_file=None,
-        usage_unreadable_file=None,
+        unreadable_usages=(),
         unlocated_file=None,
     )
 
@@ -2216,7 +2234,7 @@ def test_read_memory_more_waiting_than_inactive_cache(fake_cgroup: Callable[...,
         unflushed_cache=350,
         limit_level=str(root),
         unreadable_file=None,
-        usage_unreadable_file=None,
+        unreadable_usages=(),
         unlocated_file=None,
     )
 
@@ -2247,7 +2265,7 @@ def test_read_memory_without_the_dirty_keys(fake_cgroup: Callable[..., Path]) ->
         unflushed_cache=None,
         limit_level=str(root / 'memory'),
         unreadable_file=None,
-        usage_unreadable_file=None,
+        unreadable_usages=(),
         unlocated_file=None,
     )
 
@@ -2271,7 +2289,11 @@ def test_read_memory_dirty_keys_without_the_inactive_cache(fake_cgroup: Callable
         unflushed_cache=None,
         limit_level=str(root),
         unreadable_file=None,
-        usage_unreadable_file=f'{root / "memory.stat"} (has no inactive_file)',
+        unreadable_usages=(
+            cgroup.UnreadableUsage(
+                file=f'{root / "memory.stat"} (has no inactive_file)', limit=1000, set_available=True
+            ),
+        ),
         unlocated_file=None,
     )
 
@@ -2302,7 +2324,7 @@ def test_read_memory_reports_the_cache_of_the_deciding_level(fake_cgroup: Callab
         unflushed_cache=5,
         limit_level=str(root / 'kubepods' / 'pod'),
         unreadable_file=None,
-        usage_unreadable_file=None,
+        unreadable_usages=(),
         unlocated_file=None,
     )
 
@@ -2334,7 +2356,7 @@ def test_read_memory_reports_the_cache_of_the_closest_level_on_a_tie(fake_cgroup
         unflushed_cache=2,
         limit_level=str(root / 'kubepods' / 'pod'),
         unreadable_file=None,
-        usage_unreadable_file=None,
+        unreadable_usages=(),
         unlocated_file=None,
     )
 
@@ -2389,7 +2411,7 @@ def test_read_memory_with_the_dirty_keys_at_zero(fake_cgroup: Callable[..., Path
         unflushed_cache=0,
         limit_level=str(root),
         unreadable_file=None,
-        usage_unreadable_file=None,
+        unreadable_usages=(),
         unlocated_file=None,
     )
 
@@ -2414,7 +2436,7 @@ def test_read_memory_unparsable_dirty_key(fake_cgroup: Callable[..., Path]) -> N
         unflushed_cache=100,
         limit_level=str(root),
         unreadable_file=None,
-        usage_unreadable_file=None,
+        unreadable_usages=(),
         unlocated_file=None,
     )
 
@@ -2451,7 +2473,7 @@ def test_read_memory_negative_dirty_key(fake_cgroup: Callable[..., Path]) -> Non
         unflushed_cache=0,
         limit_level=str(root),
         unreadable_file=None,
-        usage_unreadable_file=None,
+        unreadable_usages=(),
         unlocated_file=None,
     )
 
@@ -2476,7 +2498,7 @@ def test_read_memory_negative_key_beside_a_positive_one(fake_cgroup: Callable[..
         unflushed_cache=500,
         limit_level=str(root),
         unreadable_file=None,
-        usage_unreadable_file=None,
+        unreadable_usages=(),
         unlocated_file=None,
     )
 
@@ -2503,7 +2525,7 @@ def test_read_memory_no_readable_limit(fake_cgroup: Callable[..., Path]) -> None
         unflushed_cache=None,
         limit_level=None,
         unreadable_file=f'{root / "pod" / "container" / "memory.max"} (holds no number)',
-        usage_unreadable_file=None,
+        unreadable_usages=(),
         unlocated_file=None,
     )
 
@@ -2531,7 +2553,11 @@ def test_read_memory_bounds_a_silent_parent_by_the_own_cgroup(fake_cgroup: Calla
         unflushed_cache=None,
         limit_level=str(root / 'pod'),
         unreadable_file=None,
-        usage_unreadable_file=f'{root / "pod" / "memory.current"} ({OPENING_A_DIRECTORY})',
+        unreadable_usages=(
+            cgroup.UnreadableUsage(
+                file=f'{root / "pod" / "memory.current"} ({OPENING_A_DIRECTORY})', limit=1000, set_available=True
+            ),
+        ),
         unlocated_file=None,
     )
 
@@ -2561,7 +2587,11 @@ def test_read_memory_bound_takes_the_largest_charge_below(fake_cgroup: Callable[
         unflushed_cache=None,
         limit_level=str(root / 'kubepods'),
         unreadable_file=None,
-        usage_unreadable_file=f'{root / "kubepods" / "memory.current"} ({OPENING_A_DIRECTORY})',
+        unreadable_usages=(
+            cgroup.UnreadableUsage(
+                file=f'{root / "kubepods" / "memory.current"} ({OPENING_A_DIRECTORY})', limit=1000, set_available=True
+            ),
+        ),
         unlocated_file=None,
     )
 
@@ -2592,7 +2622,11 @@ def test_read_memory_bound_takes_the_largest_charge_of_several_unlimited_levels(
         unflushed_cache=None,
         limit_level=str(root / 'kubepods'),
         unreadable_file=None,
-        usage_unreadable_file=f'{root / "kubepods" / "memory.current"} ({OPENING_A_DIRECTORY})',
+        unreadable_usages=(
+            cgroup.UnreadableUsage(
+                file=f'{root / "kubepods" / "memory.current"} ({OPENING_A_DIRECTORY})', limit=1000, set_available=True
+            ),
+        ),
         unlocated_file=None,
     )
 
@@ -2623,7 +2657,11 @@ def test_read_memory_bound_keeps_a_larger_charge_read_further_down(fake_cgroup: 
         unflushed_cache=None,
         limit_level=str(root / 'kubepods'),
         unreadable_file=None,
-        usage_unreadable_file=f'{root / "kubepods" / "memory.current"} ({OPENING_A_DIRECTORY})',
+        unreadable_usages=(
+            cgroup.UnreadableUsage(
+                file=f'{root / "kubepods" / "memory.current"} ({OPENING_A_DIRECTORY})', limit=1000, set_available=True
+            ),
+        ),
         unlocated_file=None,
     )
 
@@ -2652,7 +2690,11 @@ def test_read_memory_bound_reads_past_a_level_that_cannot_be_read(fake_cgroup: C
         unflushed_cache=None,
         limit_level=str(root / 'kubepods'),
         unreadable_file=None,
-        usage_unreadable_file=f'{root / "kubepods" / "memory.current"} ({OPENING_A_DIRECTORY})',
+        unreadable_usages=(
+            cgroup.UnreadableUsage(
+                file=f'{root / "kubepods" / "memory.current"} ({OPENING_A_DIRECTORY})', limit=1000, set_available=True
+            ),
+        ),
         unlocated_file=None,
     )
 
@@ -2688,7 +2730,9 @@ def test_read_memory_names_why_a_usage_cannot_be_read(
         },
     )
 
-    assert cgroup.read_memory().usage_unreadable_file == f'{root / "pod" / name} ({reason})'
+    assert cgroup.read_memory().unreadable_usages == (
+        cgroup.UnreadableUsage(file=f'{root / "pod" / name} ({reason})', limit=1000, set_available=True),
+    )
 
 
 @pytest.mark.parametrize(
@@ -2716,7 +2760,9 @@ def test_read_memory_names_an_absent_usage_file_out_of_descriptors(
     )
     fail_to_read(monkeypatch, root / 'pod' / name, emfile(), times=None)
 
-    assert cgroup.read_memory().usage_unreadable_file == f'{root / "pod" / name} (absent)'
+    assert cgroup.read_memory().unreadable_usages == (
+        cgroup.UnreadableUsage(file=f'{root / "pod" / name} (absent)', limit=1000, set_available=True),
+    )
 
 
 def test_read_memory_silent_level_between_two_that_answer(fake_cgroup: Callable[..., Path]) -> None:
@@ -2745,7 +2791,13 @@ def test_read_memory_silent_level_between_two_that_answer(fake_cgroup: Callable[
         unflushed_cache=7,
         limit_level=str(root / 'kubepods' / 'pod' / 'container'),
         unreadable_file=None,
-        usage_unreadable_file=f'{root / "kubepods" / "pod" / "memory.current"} ({OPENING_A_DIRECTORY})',
+        unreadable_usages=(
+            cgroup.UnreadableUsage(
+                file=f'{root / "kubepods" / "pod" / "memory.current"} ({OPENING_A_DIRECTORY})',
+                limit=1000,
+                set_available=False,
+            ),
+        ),
         unlocated_file=None,
     )
 
@@ -2807,8 +2859,8 @@ def test_read_memory_bound_skips_the_levels_below_a_charge_read(
     assert root / 'kubepods' / 'pod' / 'container' / 'memory.current' not in read
 
 
-def test_read_memory_names_the_closest_silent_usage(fake_cgroup: Callable[..., Path]) -> None:
-    """Names the usage file of the closest level when two levels holding a limit cannot be read."""
+def test_read_memory_lists_every_silent_usage_closest_first(fake_cgroup: Callable[..., Path]) -> None:
+    """Lists the usage file of every level holding a limit that cannot be read, closest first."""
     root = fake_cgroup(
         mountinfo=V2_MOUNTINFO,
         self_cgroup=V2_SELF_CGROUP.format(path='/pod/container'),
@@ -2822,12 +2874,21 @@ def test_read_memory_names_the_closest_silent_usage(fake_cgroup: Callable[..., P
     (root / 'pod' / 'container' / 'memory.current').mkdir()
     (root / 'pod' / 'memory.current').mkdir()
 
-    expected = f'{root / "pod" / "container" / "memory.current"} ({OPENING_A_DIRECTORY})'
-    assert cgroup.read_memory().usage_unreadable_file == expected
+    # Both are charged nothing, so the container is the closer to its limit.
+    assert cgroup.read_memory().unreadable_usages == (
+        cgroup.UnreadableUsage(
+            file=f'{root / "pod" / "container" / "memory.current"} ({OPENING_A_DIRECTORY})',
+            limit=1000,
+            set_available=True,
+        ),
+        cgroup.UnreadableUsage(
+            file=f'{root / "pod" / "memory.current"} ({OPENING_A_DIRECTORY})', limit=2000, set_available=False
+        ),
+    )
 
 
-def test_read_memory_names_no_usage_at_a_level_reaching_the_ceiling(fake_cgroup: Callable[..., Path]) -> None:
-    """Names no unreadable usage at a level whose limit reaches the ceiling."""
+def test_read_memory_lists_a_silent_sentinel(fake_cgroup: Callable[..., Path]) -> None:
+    """Lists a silent level whose limit is a sentinel, and reads the room from the level that sets it."""
     root = fake_cgroup(
         mountinfo=V1_MOUNTINFO,
         self_cgroup=V1_SELF_CGROUP.format(path='/limited'),
@@ -2842,34 +2903,27 @@ def test_read_memory_names_no_usage_at_a_level_reaching_the_ceiling(fake_cgroup:
     )
     (root / 'memory' / 'memory.usage_in_bytes').mkdir()
 
-    # The own group sets the room, and its usage was read, so the reading is exact.
-    assert cgroup.read_memory(ceiling=16 * 1024**3) == cgroup.RawMemory(
+    # The own group sets the room, and its usage was read. Telling the sentinel from a limit is left to the sensor.
+    assert cgroup.read_memory() == cgroup.RawMemory(
         limit=536870912,
         used=104857600,
         available=432013312,
         unflushed_cache=None,
         limit_level=str(root / 'memory' / 'limited'),
         unreadable_file=None,
-        usage_unreadable_file=None,
+        unreadable_usages=(
+            cgroup.UnreadableUsage(
+                file=f'{root / "memory" / "memory.usage_in_bytes"} ({OPENING_A_DIRECTORY})',
+                limit=9223372036854771712,
+                set_available=False,
+            ),
+        ),
         unlocated_file=None,
     )
-    # Without a ceiling the sentinel cannot be told from a limit, so its usage is named.
-    expected = f'{root / "memory" / "memory.usage_in_bytes"} ({OPENING_A_DIRECTORY})'
-    assert cgroup.read_memory().usage_unreadable_file == expected
 
 
-@pytest.mark.parametrize(
-    'ceiling',
-    [
-        pytest.param(1500, id='closer limit above the ceiling'),
-        pytest.param(2000, id='closer limit at the ceiling'),
-    ],
-)
-def test_read_memory_names_a_farther_usage_past_a_level_reaching_the_ceiling(
-    fake_cgroup: Callable[..., Path],
-    ceiling: int,
-) -> None:
-    """Names the usage of a farther level whose limit counts, past a closer one whose limit reaches the ceiling."""
+def test_read_memory_lists_a_looser_silent_level_before_a_tighter_one(fake_cgroup: Callable[..., Path]) -> None:
+    """Lists a closer silent level with a looser limit first, and marks the farther, tighter one as setting the room."""
     root = fake_cgroup(
         mountinfo=V2_MOUNTINFO,
         self_cgroup=V2_SELF_CGROUP.format(path='/pod/container'),
@@ -2883,12 +2937,20 @@ def test_read_memory_names_a_farther_usage_past_a_level_reaching_the_ceiling(
     (root / 'pod' / 'container' / 'memory.current').mkdir()
     (root / 'pod' / 'memory.current').mkdir()
 
-    expected = f'{root / "pod" / "memory.current"} ({OPENING_A_DIRECTORY})'
-    assert cgroup.read_memory(ceiling=ceiling).usage_unreadable_file == expected
+    assert cgroup.read_memory().unreadable_usages == (
+        cgroup.UnreadableUsage(
+            file=f'{root / "pod" / "container" / "memory.current"} ({OPENING_A_DIRECTORY})',
+            limit=2000,
+            set_available=False,
+        ),
+        cgroup.UnreadableUsage(
+            file=f'{root / "pod" / "memory.current"} ({OPENING_A_DIRECTORY})', limit=1000, set_available=True
+        ),
+    )
 
 
-def test_read_memory_names_a_level_reaching_the_ceiling_that_sets_the_room(fake_cgroup: Callable[..., Path]) -> None:
-    """Names the usage of a level whose limit reaches the ceiling where its lower bound sets the room."""
+def test_read_memory_marks_a_looser_silent_level_whose_bound_sets_the_room(fake_cgroup: Callable[..., Path]) -> None:
+    """Marks a silent level with a looser limit as setting the room where its lower bound leaves the least."""
     root = fake_cgroup(
         mountinfo=V2_MOUNTINFO,
         self_cgroup=V2_SELF_CGROUP.format(path='/slice/pod/container'),
@@ -2906,14 +2968,18 @@ def test_read_memory_names_a_level_reaching_the_ceiling_that_sets_the_room(fake_
     (root / 'slice' / 'memory.current').mkdir()
 
     # 700 left at the container, and at most 600 at the slice, which is charged at least the 1000 of the pod.
-    assert cgroup.read_memory(ceiling=1600) == cgroup.RawMemory(
+    assert cgroup.read_memory() == cgroup.RawMemory(
         limit=800,
         used=200,
         available=600,
         unflushed_cache=None,
         limit_level=str(root / 'slice' / 'pod' / 'container'),
         unreadable_file=None,
-        usage_unreadable_file=f'{root / "slice" / "memory.current"} ({OPENING_A_DIRECTORY})',
+        unreadable_usages=(
+            cgroup.UnreadableUsage(
+                file=f'{root / "slice" / "memory.current"} ({OPENING_A_DIRECTORY})', limit=1600, set_available=True
+            ),
+        ),
         unlocated_file=None,
     )
 
@@ -2941,7 +3007,13 @@ def test_read_memory_prefers_a_read_level_on_a_tie(fake_cgroup: Callable[..., Pa
         unflushed_cache=3,
         limit_level=str(root / 'pod' / 'container'),
         unreadable_file=None,
-        usage_unreadable_file=f'{root / "pod" / "container" / "memory.current"} ({OPENING_A_DIRECTORY})',
+        unreadable_usages=(
+            cgroup.UnreadableUsage(
+                file=f'{root / "pod" / "container" / "memory.current"} ({OPENING_A_DIRECTORY})',
+                limit=500,
+                set_available=False,
+            ),
+        ),
         unlocated_file=None,
     )
 
@@ -3107,7 +3179,9 @@ def test_read_memory_names_the_errno_a_stat_file_failed_with(
     refused = root / 'memory.stat'
     fail_to_read(monkeypatch, refused, OSError(errno.EACCES, os.strerror(errno.EACCES)), times=None)
 
-    assert cgroup.read_memory().usage_unreadable_file == f'{refused} (EACCES)'
+    assert cgroup.read_memory().unreadable_usages == (
+        cgroup.UnreadableUsage(file=f'{refused} (EACCES)', limit=1000, set_available=True),
+    )
 
 
 @pytest.mark.parametrize(

@@ -50,6 +50,12 @@ on cgroup v1, and the unified mount carries counters of another scope."""
 NOTICE_PREFIXES = {'memory': ('memory', 'machine-memory'), 'cpu': ('cpu', 'machine-cpu')}
 """How a notice code names the metric it is about. `machine-memory-unknown` is a memory notice."""
 
+UNSIZEABLE_SHARE = (
+    'The CPU limit of job is a share of the machine, and the cores of the machine cannot be read. A share says '
+    'nothing about cores on its own, '
+)
+"""How the notice for a share of a machine of unknown size begins. What follows says what the reading kept."""
+
 # The autouse fixture below replaces these module attributes, so the tests of the real implementations go
 # through references captured before any fixture runs.
 real_machine_memory_bytes = _sensor.get_machine_memory_bytes
@@ -226,7 +232,7 @@ def test_get_memory_budget_usage_the_mechanism_does_not_offer(monkeypatch: pytes
         unflushed_cache=None,
         limit_level='job',
         unreadable_file=None,
-        usage_unreadable_file=None,
+        unreadable_usages=(),
         unlocated_file=None,
     )
     monkeypatch.setattr(_backend, 'read_memory', lambda **_: raw)
@@ -244,7 +250,7 @@ def test_get_memory_budget_brings_a_disagreeing_triple_into_range(monkeypatch: p
         unflushed_cache=None,
         limit_level='job',
         unreadable_file=None,
-        usage_unreadable_file=None,
+        unreadable_usages=(),
         unlocated_file=None,
     )
     monkeypatch.setattr(_backend, 'read_memory', lambda **_: raw)
@@ -265,7 +271,7 @@ def test_get_memory_budget_keeps_a_room_the_mechanism_made_smaller(monkeypatch: 
         unflushed_cache=None,
         limit_level='job',
         unreadable_file=None,
-        usage_unreadable_file=None,
+        unreadable_usages=(),
         unlocated_file=None,
     )
     monkeypatch.setattr(_backend, 'read_memory', lambda **_: raw)
@@ -283,6 +289,8 @@ def test_get_memory_budget_fake_limit_without_usage(fake_cgroup: Callable[..., P
 
     assert proclimits.get_memory_budget() is None
     assert notice_codes('memory') == ('memory-limit-covers-machine',)
+    # The usage is bounded rather than missing: a lone level has nothing below it, so it is charged zero.
+    assert proclimits.describe().raw_memory_used == 0
 
 
 @pytest.mark.usefixtures('_no_cgroup')
@@ -444,33 +452,89 @@ def test_get_cpu_limit_notices(monkeypatch: pytest.MonkeyPatch) -> None:
     assert notice_codes('cpu') == ('cpu-quota-covers-machine', 'cpu-set-covers-machine')
 
 
+def job_cpu(monkeypatch: pytest.MonkeyPatch, raw: _types.RawCpu) -> None:
+    """Serve one CPU reading as a job object would, on a machine whose cores cannot be read.
+
+    A job object always reports its source, so a reading without a restriction is not a missing mechanism.
+    """
+    source = _types.Source(interface=_types.Interface.WINDOWS_JOB_OBJECT, levels=('job',))
+    sources = _types.Sources(memory=source, cpu_quota=source, cpu_set=source, cpu_usage=source, unlocated_file=None)
+    monkeypatch.setattr(_backend, 'read_cpu', lambda: raw)
+    monkeypatch.setattr(_backend, 'sources', lambda: sources)
+    monkeypatch.setattr(_sensor, 'get_machine_cpu_count', lambda: None)
+
+
+def cpu_messages() -> tuple[tuple[str, str], ...]:
+    """The CPU notices of the current description, each as its code and its message."""
+    return tuple(
+        (str(notice.code), notice.message)
+        for notice in proclimits.describe().notices
+        if str(notice.code).startswith(NOTICE_PREFIXES['cpu'])
+    )
+
+
+@pytest.mark.usefixtures('_no_cgroup')
 def test_cpu_limit_from_an_unsizeable_share(monkeypatch: pytest.MonkeyPatch) -> None:
     """Reports nothing, and names the level, where a limit is a share of a machine of unknown size."""
-    raw = _cgroup.RawCpu(quota=None, cpu_set=None, unreadable_file=None, unconvertible_level='job', unlocated_file=None)
-    monkeypatch.setattr(_backend, 'read_cpu', lambda: raw)
+    job_cpu(
+        monkeypatch,
+        _types.RawCpu(quota=None, cpu_set=None, unreadable_file=None, unconvertible_level='job', unlocated_file=None),
+    )
 
     assert proclimits.get_cpu_limit() is None
-    assert notice_codes('cpu') == ('machine-cpu-count-unknown',)
-    assert 'job' in next(n.message for n in proclimits.describe().notices if str(n.code).startswith('machine-cpu'))
+    assert cpu_messages() == (('machine-cpu-count-unknown', f'{UNSIZEABLE_SHARE}so nothing is reported.'),)
 
 
-def test_an_unsizeable_share_drops_the_other_reading(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Drops a reading in cores alongside it, because the share that cannot be sized may be the tighter one."""
-    counter = '/sys/fs/cgroup'
-    raw = _cgroup.RawCpu(
-        quota=_cgroup.RawCpuQuota(cores=4.0, limit_level=counter, usage_level=counter),
-        cpu_set=_cgroup.RawCpuSet(cores=2, limit_level=counter, usage_level=counter),
-        unreadable_file=None,
-        unconvertible_level='job',
-        unlocated_file=None,
+@pytest.mark.usefixtures('_no_cgroup')
+def test_an_unsizeable_share_leaves_the_set_to_bind(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reports the set beside a share that cannot be sized, and says a tighter limit may apply."""
+    job_cpu(
+        monkeypatch,
+        _types.RawCpu(
+            quota=None,
+            cpu_set=_types.RawCpuSet(cores=2, limit_level='job', usage_level='job'),
+            unreadable_file=None,
+            unconvertible_level='job',
+            unlocated_file=None,
+        ),
     )
-    monkeypatch.setattr(_backend, 'read_cpu', lambda: raw)
 
     description = proclimits.describe()
 
-    assert description.cpu_limit is None
-    assert (description.raw_cpu_quota, description.raw_cpu_set_size) == (None, None)
-    assert notice_codes('cpu') == ('machine-cpu-count-unknown',)
+    # The set is in cores, so it is trusted though the machine cannot be counted. Its levels are the ones reported.
+    assert proclimits.get_cpu_limit() == 2.0
+    assert (description.cpu_limit, description.raw_cpu_quota, description.raw_cpu_set_size) == (2.0, None, 2)
+    assert (description.cpu_limit_level, description.cpu_rate_level) == ('job', 'job')
+    assert cpu_messages() == (
+        (
+            'machine-cpu-count-unknown',
+            f'{UNSIZEABLE_SHARE}so it is left out. A tighter limit than the one read may apply.',
+        ),
+    )
+
+
+@pytest.mark.usefixtures('_no_cgroup')
+def test_an_unsizeable_share_beside_an_unreadable_affinity(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reports nothing where the share cannot be sized and the affinity cannot be read, and names both."""
+    job_cpu(
+        monkeypatch,
+        _types.RawCpu(
+            quota=None,
+            cpu_set=None,
+            unreadable_file='JobObjectGroupInformationEx (error 1450)',
+            unconvertible_level='job',
+            unlocated_file=None,
+        ),
+    )
+
+    assert proclimits.get_cpu_limit() is None
+    assert cpu_messages() == (
+        ('machine-cpu-count-unknown', f'{UNSIZEABLE_SHARE}so nothing is reported.'),
+        (
+            'cpu-limit-unreadable',
+            'The CPU limit in JobObjectGroupInformationEx (error 1450) cannot be read, so nothing is reported.',
+        ),
+    )
 
 
 def test_get_cpu_used_ratio(fake_cgroup: Callable[..., Path], monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1272,7 +1336,7 @@ def test_a_cache_cleared_after_a_reading_is_not_a_missing_mechanism(
     )
     read = getattr(_backend, reading)
 
-    def read_then_clear(**options: bool | int | None) -> _types.RawMemory | _types.RawCpu:
+    def read_then_clear(**options: bool) -> _types.RawMemory | _types.RawCpu:
         raw = read(**options)
         # Another thread forgets the discovery here, and the next `/proc` read fails.
         _cgroup.clear_cache()
@@ -1797,19 +1861,6 @@ def test_unreadable_limit_beside_a_limit_covering_the_machine(fake_cgroup: Calla
     assert notice_codes('memory') == ('memory-limit-unreadable', 'memory-limit-covers-machine')
 
 
-def test_unreadable_usage_beside_a_limit_covering_the_machine(fake_cgroup: Callable[..., Path]) -> None:
-    """Names no unreadable usage beside a limit dropped for covering the machine, which leaves no budget to bound."""
-    fake_cgroup(
-        mountinfo=V2_MOUNTINFO,
-        self_cgroup=V2_SELF_CGROUP.format(path='/'),
-        files={'memory.max': f'{MACHINE_TOTAL_BYTES * 2}\n', 'memory.current': '100\n', 'memory.stat': 'anon 0\n'},
-    )
-
-    assert proclimits.get_memory_budget() is None
-    assert notice_codes('memory') == ('memory-limit-covers-machine',)
-    assert proclimits.describe().raw_memory_used == 0
-
-
 def test_get_memory_budget_beside_a_usage_nobody_may_read(
     fake_cgroup: Callable[..., Path],
     monkeypatch: pytest.MonkeyPatch,
@@ -1928,6 +1979,65 @@ def test_get_memory_budget_beside_a_silent_looser_limit(fake_cgroup: Callable[..
         limit=536870912, used=100000000, available=436870912
     )
     assert notice_codes('memory') == ('memory-usage-unreadable',)
+
+
+@pytest.mark.parametrize(
+    'closer_limit',
+    [
+        pytest.param(MACHINE_TOTAL_BYTES * 2, id='closer limit above the ceiling'),
+        # A limit at the ceiling restricts nothing, as one above it does.
+        pytest.param(MACHINE_TOTAL_BYTES, id='closer limit at the ceiling'),
+    ],
+)
+def test_get_memory_budget_names_a_farther_silent_level_past_one_reaching_the_ceiling(
+    fake_cgroup: Callable[..., Path],
+    closer_limit: int,
+) -> None:
+    """Names the usage of a farther level whose limit counts, past a closer one whose limit reaches the ceiling."""
+    root = fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/pod/container'),
+        files={
+            'pod/container/memory.max': f'{closer_limit}\n',
+            'pod/container/memory.stat': 'inactive_file 0\n',
+            'pod/memory.max': f'{1024**3}\n',
+            'pod/memory.stat': 'inactive_file 0\n',
+        },
+    )
+    (root / 'pod' / 'container' / 'memory.current').mkdir()
+    (root / 'pod' / 'memory.current').mkdir()
+
+    description = proclimits.describe()
+
+    # Neither usage reads, and nothing below either level does, so both are charged nothing.
+    assert description.memory_budget == proclimits.MemoryBudget(limit=1024**3, used=0, available=1024**3)
+    (notice,) = description.notices
+    assert notice.code is proclimits.NoticeCode.MEMORY_USAGE_UNREADABLE
+    assert notice.message.startswith(f'The memory usage in {root / "pod" / "memory.current"} (')
+
+
+def test_get_memory_budget_names_the_closest_silent_level_whose_limit_counts(fake_cgroup: Callable[..., Path]) -> None:
+    """Names the usage of the closest level whose limit counts, though a farther one sets the room."""
+    root = fake_cgroup(
+        mountinfo=V2_MOUNTINFO,
+        self_cgroup=V2_SELF_CGROUP.format(path='/pod/container'),
+        files={
+            'pod/container/memory.max': '2000\n',
+            'pod/container/memory.stat': 'inactive_file 0\n',
+            'pod/memory.max': '1000\n',
+            'pod/memory.stat': 'inactive_file 0\n',
+        },
+    )
+    (root / 'pod' / 'container' / 'memory.current').mkdir()
+    (root / 'pod' / 'memory.current').mkdir()
+
+    description = proclimits.describe()
+
+    # Both are charged nothing, so the pod is the closer to its limit and sets the room.
+    assert description.memory_budget == proclimits.MemoryBudget(limit=1000, used=0, available=1000)
+    (notice,) = description.notices
+    assert notice.code is proclimits.NoticeCode.MEMORY_USAGE_UNREADABLE
+    assert notice.message.startswith(f'The memory usage in {root / "pod" / "container" / "memory.current"} (')
 
 
 def unreadable_container_quota(fake_cgroup: Callable[..., Path]) -> Path:

@@ -206,7 +206,7 @@ def test_read_memory_derives_the_usage_from_the_commit(monkeypatch: pytest.Monke
 
     assert (raw.limit, raw.used, raw.available) == (512 * MIB, 12 * MIB, 500 * MIB)
     # The commit answered for the usage, so the failed query is not named.
-    assert raw.usage_unreadable_file is None
+    assert raw.unreadable_usages == ()
 
 
 def test_read_memory_without_a_usage_figure(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -222,8 +222,12 @@ def test_read_memory_without_a_usage_figure(monkeypatch: pytest.MonkeyPatch) -> 
 
     # A job is one level with nothing below it, so zero is the only bound there is.
     assert (raw.limit, raw.used, raw.available) == (512 * MIB, 0, 512 * MIB)
-    # Two calls failed, so this is a fault to look into rather than the shape of the job.
-    assert raw.usage_unreadable_file == f'JobObjectLimitViolationInformation (error {QUERY_FAILED})'
+    # Two calls failed, so this is a fault to look into rather than the shape of the job. The one level sets the room.
+    assert raw.unreadable_usages == (
+        _windows.UnreadableUsage(
+            file=f'JobObjectLimitViolationInformation (error {QUERY_FAILED})', limit=512 * MIB, set_available=True
+        ),
+    )
 
 
 def test_job_memory_in_use_reads_the_violation_class(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -250,7 +254,7 @@ def test_read_memory_with_only_a_per_process_limit(monkeypatch: pytest.MonkeyPat
     assert (raw.limit, raw.used, raw.available) == (256 * MIB, None, None)
     assert raw.limit_level == 'job'
     # No call failed: a per-process limit is a shape the job pairs no usage figure with.
-    assert raw.usage_unreadable_file is None
+    assert raw.unreadable_usages == ()
     assert raw.unlocated_file is None
 
 
@@ -336,7 +340,7 @@ def test_read_cpu_takes_both_restrictions(monkeypatch: pytest.MonkeyPatch) -> No
 
 
 def test_read_cpu_without_the_machine_cores(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Drops both readings where a rate cannot be sized, because the share may be the tighter one."""
+    """Leaves out a rate that cannot be sized and names its level, and still counts the affinity beside it."""
     monkeypatch.setattr(
         _windows,
         '_query',
@@ -350,8 +354,63 @@ def test_read_cpu_without_the_machine_cores(monkeypatch: pytest.MonkeyPatch) -> 
 
     raw = _windows.read_cpu()
 
-    assert raw.unconvertible_level == 'job'
-    assert (raw.quota, raw.cpu_set, raw.unreadable_file, raw.unlocated_file) == (None, None, None, None)
+    assert raw == _windows.RawCpu(
+        quota=None,
+        cpu_set=_windows.RawCpuSet(cores=3, limit_level='job', usage_level='job'),
+        unreadable_file=None,
+        unconvertible_level='job',
+        unlocated_file=None,
+    )
+
+
+def test_read_cpu_without_the_machine_cores_on_a_job_without_an_affinity(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Names a rate that cannot be sized where the job restricts nothing else, the usual shape of a capped job."""
+    monkeypatch.setattr(
+        _windows,
+        '_query',
+        answering(
+            _JOB_EXTENDED_LIMIT=extended_limits(),
+            _JOB_CPU_RATE_CONTROL=rate_control(ENABLE | HARD_CAP, cpu_rate=750),
+        ),
+    )
+    monkeypatch.setattr(_windows, 'machine_cpu_count', lambda: None)
+
+    assert _windows.read_cpu() == _windows.RawCpu(
+        quota=None, cpu_set=None, unreadable_file=None, unconvertible_level='job', unlocated_file=None
+    )
+
+
+@pytest.mark.parametrize(
+    ('answer', 'reason'),
+    [
+        pytest.param((None, QUERY_FAILED), f'error {QUERY_FAILED}', id='the query failed'),
+        pytest.param(([0, 0], 0), 'counts no core', id='an affinity of no cores at all'),
+    ],
+)
+def test_read_cpu_without_the_machine_cores_or_the_affinity(
+    monkeypatch: pytest.MonkeyPatch, answer: tuple[list[int] | None, int], reason: str
+) -> None:
+    """Names both a rate that cannot be sized and an affinity that cannot be counted, and reports neither."""
+    monkeypatch.setattr(
+        _windows,
+        '_query',
+        answering(
+            _JOB_EXTENDED_LIMIT=extended_limits(flags=LIMIT_AFFINITY, affinity=0b111),
+            _JOB_CPU_RATE_CONTROL=rate_control(ENABLE | HARD_CAP, cpu_rate=750),
+        ),
+    )
+    monkeypatch.setattr(_windows, 'machine_cpu_count', lambda: None)
+    monkeypatch.setattr(_windows, '_group_affinity_masks', lambda: answer)
+
+    raw = _windows.read_cpu()
+
+    assert raw == _windows.RawCpu(
+        quota=None,
+        cpu_set=None,
+        unreadable_file=f'JobObjectGroupInformationEx ({reason})',
+        unconvertible_level='job',
+        unlocated_file=None,
+    )
 
 
 def test_read_cpu_keeps_an_affinity_without_the_machine_cores(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -422,7 +481,7 @@ def test_machine_cpu_count_refuses_the_fallback_across_groups(monkeypatch: pytes
 def test_read_cpu_when_the_affinity_cannot_be_counted(
     monkeypatch: pytest.MonkeyPatch, answer: tuple[list[int] | None, int], reason: str
 ) -> None:
-    """Calls a job holding an affinity it will not count unreadable, rather than unrestricted, and says why."""
+    """Calls an affinity the job will not count unreadable, rather than unrestricted, and keeps the rate beside it."""
     monkeypatch.setattr(
         _windows,
         '_query',
@@ -436,8 +495,10 @@ def test_read_cpu_when_the_affinity_cannot_be_counted(
 
     raw = _windows.read_cpu()
 
+    # The rate of 7.5% on a machine of 20 cores.
+    quota = _windows.RawCpuQuota(cores=1.5, limit_level='job', usage_level='job')
     expected = f'JobObjectGroupInformationEx ({reason})'
-    assert (raw.quota, raw.cpu_set, raw.unreadable_file, raw.unlocated_file) == (None, None, expected, None)
+    assert (raw.quota, raw.cpu_set, raw.unreadable_file, raw.unlocated_file) == (quota, None, expected, None)
 
 
 def test_group_affinity_masks_carry_the_code_the_query_failed_with(monkeypatch: pytest.MonkeyPatch) -> None:

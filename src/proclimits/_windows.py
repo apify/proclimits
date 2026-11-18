@@ -14,6 +14,7 @@ from ._types import (
     RawMemory,
     Source,
     Sources,
+    UnreadableUsage,
 )
 
 _LEVEL = 'job'
@@ -302,7 +303,7 @@ _NO_MEMORY = RawMemory(
     unflushed_cache=None,
     limit_level=None,
     unreadable_file=None,
-    usage_unreadable_file=None,
+    unreadable_usages=(),
     unlocated_file=None,
 )
 """What is reported where no job limits the memory."""
@@ -314,7 +315,7 @@ _Structure = TypeVar('_Structure', bound=ctypes.Structure)
 _Raw = TypeVar('_Raw', RawMemory, RawCpu)
 
 
-def read_memory(*, throttle_limits: bool = False, ceiling: int | None = None) -> RawMemory:  # noqa: ARG001
+def read_memory(*, throttle_limits: bool = False) -> RawMemory:  # noqa: ARG001
     """Read the memory limit of the job holding this process, with the memory charged against it.
 
     A job can limit the whole job and each of its processes separately. The job-wide limit is reported with
@@ -323,7 +324,6 @@ def read_memory(*, throttle_limits: bool = False, ceiling: int | None = None) ->
 
     Args:
         throttle_limits: Ignored. Only the commit limits of a job are read as memory limits.
-        ceiling: Ignored. A job is one level, and the sensor drops a job limit that reaches the ceiling.
     """
     limits, error = _query(_JOB_EXTENDED_LIMIT, _ExtendedLimits)
     if limits is None:
@@ -343,7 +343,7 @@ def read_memory(*, throttle_limits: bool = False, ceiling: int | None = None) ->
             unflushed_cache=None,
             limit_level=_LEVEL,
             unreadable_file=None,
-            usage_unreadable_file=None,
+            unreadable_usages=(),
             unlocated_file=None,
         )
 
@@ -373,39 +373,39 @@ def read_cpu() -> RawCpu:
     rate = _rate_cap(control)
     machine_cores = machine_cpu_count()
 
-    if rate is not None and machine_cores is None:
-        # A rate is a share of the machine, so without the size of the machine it says nothing about cores.
-        # The affinity mask goes with it: the share that cannot be sized may be the tighter of the two.
-        return replace(_NO_CPU, unconvertible_level=_LEVEL)
-
     quota = (
         RawCpuQuota(cores=rate * machine_cores, limit_level=_LEVEL, usage_level=_LEVEL)
         if rate is not None and machine_cores is not None
         else None
     )
 
+    # A rate is a share of the machine, so without the size of the machine it says nothing about cores. Such a
+    # rate is left out and its level is named. The affinity is still read, as the rate is kept beside an affinity
+    # that cannot be read.
+    unconvertible_level = _LEVEL if rate is not None and machine_cores is None else None
+    reading = replace(_NO_CPU, quota=quota, unconvertible_level=unconvertible_level)
+
     # The flag gates the group-aware read, and has to: that class answers for a job with no affinity as
     # well, with every core of the machine, measured. No measured way of setting one leaves the flag clear -
     # through the basic limits it is raised by construction, being a field of that structure, and the kernel
     # raises it for the group-aware class and for `JobObjectGroupInformation`, which carries no mask at all.
-    cpu_set = None
     if limits.BasicLimitInformation.LimitFlags & _LIMIT_AFFINITY:
         masks, error = _group_affinity_masks()
 
         # The job restricts the cores and will not say which, so what it allows is unknown rather than
-        # unrestricted. The rate read above goes with it, because the unread affinity may be the tighter of the
-        # two. The measurement that the queries answer or fail together covers the rate control against the
+        # unrestricted. The affinity is left out and the rate stays, as a quota stays beside an unreadable cpuset
+        # on Linux. The measurement that the queries answer or fail together covers the rate control against the
         # extended limits, not this class.
         if masks is None:
-            return replace(_NO_CPU, unreadable_file=_failed_query(_JOB_GROUP_AFFINITY, error))
+            return replace(reading, unreadable_file=_failed_query(_JOB_GROUP_AFFINITY, error))
 
         allowed = sum(mask.bit_count() for mask in masks)
         if not allowed:
-            return replace(_NO_CPU, unreadable_file=f'{_JOB_INFO_CLASS_NAMES[_JOB_GROUP_AFFINITY]} (counts no core)')
+            return replace(reading, unreadable_file=f'{_JOB_INFO_CLASS_NAMES[_JOB_GROUP_AFFINITY]} (counts no core)')
 
-        cpu_set = RawCpuSet(cores=allowed, limit_level=_LEVEL, usage_level=_LEVEL)
+        return replace(reading, cpu_set=RawCpuSet(cores=allowed, limit_level=_LEVEL, usage_level=_LEVEL))
 
-    return RawCpu(quota=quota, cpu_set=cpu_set, unreadable_file=None, unconvertible_level=None, unlocated_file=None)
+    return reading
 
 
 def read_cpu_usage(level: str | None = None) -> float | None:
@@ -573,12 +573,15 @@ def _job_memory(limit: int) -> RawMemory:
     if available is None and charged is not None:
         available = max(limit - charged, 0)
 
-    usage_unreadable_file: str | None = None
+    unreadable_usages: tuple[UnreadableUsage, ...] = ()
     if charged is None or available is None:
         # Nothing charged takes two unrelated APIs refusing at once, and has never been seen on a machine. A
-        # job-wide limit does have a usage figure, so this is a guard rather than a path.
+        # job-wide limit does have a usage figure, so this is a guard rather than a path. A job is one level, so
+        # its lower bound is what sets the room.
         charged, available = 0, limit
-        usage_unreadable_file = _failed_query(_JOB_LIMIT_VIOLATION, error)
+        unreadable_usages = (
+            UnreadableUsage(file=_failed_query(_JOB_LIMIT_VIOLATION, error), limit=limit, set_available=True),
+        )
 
     return RawMemory(
         limit=limit,
@@ -588,7 +591,7 @@ def _job_memory(limit: int) -> RawMemory:
         unflushed_cache=None,
         limit_level=_LEVEL,
         unreadable_file=None,
-        usage_unreadable_file=usage_unreadable_file,
+        unreadable_usages=unreadable_usages,
         unlocated_file=None,
     )
 

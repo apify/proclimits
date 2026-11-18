@@ -17,6 +17,7 @@ from ._types import (
     RawMemory,
     Source,
     Sources,
+    UnreadableUsage,
 )
 
 _PROC_SELF_CGROUP = Path('/proc/self/cgroup')
@@ -327,7 +328,7 @@ _NO_MEMORY = RawMemory(
     unflushed_cache=None,
     limit_level=None,
     unreadable_file=None,
-    usage_unreadable_file=None,
+    unreadable_usages=(),
     unlocated_file=None,
 )
 """What is reported where no level holds a memory limit that counts."""
@@ -336,23 +337,21 @@ _NO_CPU = RawCpu(quota=None, cpu_set=None, unreadable_file=None, unconvertible_l
 """Nothing read. A reading that fails adds what it could not read."""
 
 
-def read_memory(*, throttle_limits: bool = False, ceiling: int | None = None) -> RawMemory:
+def read_memory(*, throttle_limits: bool = False) -> RawMemory:
     """Read the tightest memory limit along the chain, with a usage that keeps the distance to it.
 
     The kernel acts on the distance to a limit, not on a ratio. The smallest distance to a limit anywhere
     along the chain is therefore the quantity carried over, expressed against the tightest limit so that a
     consumer sees one comparable pair.
 
-    A limit file that cannot be read is left out, and the reading comes from the files that can. A usage that
-    cannot be read is bounded from below. The closest file of each kind that cannot be read is named.
+    A limit file that cannot be read is left out, and the reading comes from the files that can. The closest
+    such file is named. A usage that cannot be read is bounded from below, and every level holding one is listed.
 
     Where a `/proc` file keeps the controller from being located, nothing is read and `unlocated_file` names it.
 
     Args:
         throttle_limits: Whether a level's limit is the tighter of `memory.max` and `memory.high`. cgroup v1
             reads `memory.limit_in_bytes` either way.
-        ceiling: The size at which a limit restricts nothing, in bytes. A level whose limit reaches it is named
-            for an unreadable usage only where it set the distance reported. `None` lets any level be named.
     """
     controllers = locate_controllers()
 
@@ -375,16 +374,11 @@ def read_memory(*, throttle_limits: bool = False, ceiling: int | None = None) ->
     # smaller than the tightest level's. On a tie a level whose usage was read wins, so its cache is reported.
     min_distance_level = min(levels, key=lambda level: (level.distance, level.usage_unreadable_file is not None))
 
-    # Levels are listed closest first, so this names the closest level charged at a lower bound. A limit that
-    # reaches the ceiling restricts nothing, so its level is named only where its lower bound set the distance.
-    usage_unreadable_file = next(
-        (
-            level.usage_unreadable_file
-            for level in levels
-            if level.usage_unreadable_file is not None
-            and (ceiling is None or level.limit < ceiling or level is min_distance_level)
-        ),
-        None,
+    # Levels are listed closest first, and so is this.
+    unreadable_usages = tuple(
+        UnreadableUsage(file=level.usage_unreadable_file, limit=level.limit, set_available=level is min_distance_level)
+        for level in levels
+        if level.usage_unreadable_file is not None
     )
 
     return RawMemory(
@@ -394,7 +388,7 @@ def read_memory(*, throttle_limits: bool = False, ceiling: int | None = None) ->
         unflushed_cache=min_distance_level.usage.unflushed_cache,
         limit_level=str(tightest.directory),
         unreadable_file=unreadable_file,
-        usage_unreadable_file=usage_unreadable_file,
+        unreadable_usages=unreadable_usages,
         unlocated_file=None,
     )
 

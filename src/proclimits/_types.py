@@ -49,8 +49,9 @@ class NoticeCode(str, Enum):
     MACHINE_CPU_COUNT_UNKNOWN = 'machine-cpu-count-unknown'
     """A CPU limit is a share of the machine here, and the cores of the machine cannot be read.
 
-    A share cannot be turned into cores without them, so the limit is enforced but its size is unknown. Only a
-    mechanism that expresses a limit as a share raises this - a cgroup states cores outright.
+    A share cannot be turned into cores without them, so the limit is enforced but its size is unknown. It is left
+    out, as a limit that cannot be read is. Only a mechanism that expresses a limit as a share raises this - a
+    cgroup states cores outright.
     """
 
     CPU_QUOTA_COVERS_MACHINE = 'cpu-quota-covers-machine'
@@ -92,8 +93,7 @@ class NoticeCode(str, Enum):
     CPU_LIMIT_UNREADABLE = 'cpu-limit-unreadable'
     """A CPU limit cannot be read, so it is left out.
 
-    A tighter limit than the one read may apply. Where no other limit can be read, nothing is reported. On
-    Windows a CPU control that will not answer drops both restrictions, so nothing is reported there either. The
+    A tighter limit than the one read may apply. Where no other limit can be read, nothing is reported. The
     message names the file and the reason, or on Windows the job query and its error code.
     """
 
@@ -185,10 +185,27 @@ class Sources:
 
 
 @dataclass(frozen=True)
+class UnreadableUsage:
+    """A level that holds a memory limit and whose usage cannot be read."""
+
+    file: str
+    """The usage file of that level, and why it cannot be read.
+
+    Spelled as `RawMemory.unreadable_file` is. A usage file that is not there is named as absent.
+    """
+
+    limit: int
+    """The limit of that level, in bytes."""
+
+    set_available: bool
+    """Whether the distance to the limit of that level set `RawMemory.available`."""
+
+
+@dataclass(frozen=True)
 class RawMemory:
     """The memory limit and usage as the mechanism spells them.
 
-    Where `unlocated_file` is set, no level was read and every other field is `None`.
+    Where `unlocated_file` is set, no level was read, `unreadable_usages` is empty and every other field is `None`.
     """
 
     limit: int | None
@@ -200,7 +217,7 @@ class RawMemory:
     used: int | None
     """The memory charged against `limit`, in bytes, as the mechanism derives it.
 
-    A lower bound where `usage_unreadable_file` is set. `None` where the mechanism pairs no usage with a limit
+    A lower bound where `unreadable_usages` is not empty. `None` where the mechanism pairs no usage with a limit
     of that kind.
     """
 
@@ -208,7 +225,7 @@ class RawMemory:
     """The distance to the limit, in bytes, as the mechanism reports it.
 
     Filled with `used` and `None` with it: the two are the pair a limit is reported against. An upper bound
-    where `usage_unreadable_file` is set.
+    where `unreadable_usages` is not empty.
     """
 
     unflushed_cache: int | None
@@ -232,15 +249,12 @@ class RawMemory:
     other fields come from the limits that answered, so a tighter limit than `limit` may apply.
     """
 
-    usage_unreadable_file: str | None
-    """The closest usage that cannot be read at a level whose limit counts, and why. `None` when every such usage
+    unreadable_usages: tuple[UnreadableUsage, ...]
+    """Every level that holds a limit and whose usage cannot be read, closest first. Empty when every such usage
     answered.
 
-    Spelled as `unreadable_file` is. A usage file that is not there is named as absent. That level keeps its
-    limit. It is charged the largest charge read below it, or zero where none was. Only ever set beside a filled
-    `used`.
-
-    A limit that reaches the memory ceiling restricts nothing. It counts only where its level set `available`.
+    Each of those levels keeps its limit. It is charged the largest charge read below it, or zero where none was.
+    Only ever filled beside a filled `used`.
     """
 
     unlocated_file: str | None
@@ -311,15 +325,16 @@ class RawCpu:
 
     Spelled as `RawMemory.unreadable_file` is. Under a cgroup this is the closest quota file that failed, else the
     set file. That control is left out. Whatever is reported comes from the controls that answered, and may be
-    looser than what applies. Under a job object both restrictions are then `None`.
+    looser than what applies. Under a job object only an affinity that cannot be read is left out on its own.
+    Where the query for the limits or for the rate fails, both restrictions are `None`.
     """
 
     unconvertible_level: str | None
     """The level holding a limit expressed as a share of the machine, when the machine's cores are unknown.
 
-    A share says nothing about cores on its own, so the reading is dropped and the level is named here. Only
-    mechanisms that express a limit that way ever set this - a cgroup states cores outright, so it is always
-    `None` there.
+    A share says nothing about cores on its own, so that limit is left out and its level is named here. The other
+    controls are still read. Only mechanisms that express a limit that way ever set this - a cgroup states cores
+    outright, so it is always `None` there.
     """
 
     unlocated_file: str | None
