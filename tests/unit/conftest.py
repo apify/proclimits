@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import errno
+import os
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -53,20 +56,59 @@ HYBRID_SELF_CGROUP = '0::/system.slice/docker.service\n3:cpu,cpuacct:/docker/abc
 """The two interfaces name different cgroups for the same process, which is what makes the layout dangerous."""
 
 
-def fail_to_read(monkeypatch: pytest.MonkeyPatch, failing: Path, error: OSError | ValueError, *, times: int) -> None:
-    """Make reading one file raise `error` the first `times` times, and read it as usual after that.
+@dataclass
+class _InjectedFailure:
+    """One failure `fail_to_read` set up, and how often it was raised."""
 
-    The error names no file, as one raised by a read after the file was opened does not.
+    path: Path
+    times: int | None
+    raised: int = 0
+
+    @property
+    def fired(self) -> bool:
+        """Whether every failure was raised, or at least one where there is no end to them."""
+        return self.raised >= 1 if self.times is None else self.raised == self.times
+
+
+_injected_failures: list[_InjectedFailure] = []
+"""The failures set up in the running test. A failure that never fires leaves the test checking another path."""
+
+
+def fail_to_read(
+    monkeypatch: pytest.MonkeyPatch, failing: Path, error: OSError | ValueError, *, times: int | None
+) -> None:
+    """Make opening one file raise `error` the first `times` times, and open it as usual after that.
+
+    With `times=None` every attempt fails. `Path.read_text` opens through `Path.open`, so a read fails too. The
+    error is raised as given. One built without a file name stands for an error raised after the file was opened,
+    which names none. The test fails unless the failures are raised: all of them, or at least one with `times=None`.
     """
-    read_text = Path.read_text
-    failures = [error] * times
+    open_path = Path.open
+    injected = _InjectedFailure(path=failing, times=times)
+    _injected_failures.append(injected)
 
-    def read_or_fail(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
-        if path == failing and failures:
-            raise failures.pop()
-        return read_text(path, encoding=encoding, errors=errors)
+    def open_or_fail(path: Path, *args: Any, **kwargs: Any) -> Any:
+        if path == failing and (times is None or injected.raised < times):
+            injected.raised += 1
+            raise error
+        return open_path(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, 'read_text', read_or_fail)
+    monkeypatch.setattr(Path, 'open', open_or_fail)
+
+
+def emfile() -> OSError:
+    """The error opening a file raises where the process has no file descriptor left."""
+    return OSError(errno.EMFILE, os.strerror(errno.EMFILE))
+
+
+@pytest.fixture(autouse=True)
+def _injected_failures_fire() -> Iterator[None]:
+    """Check that every failure `fail_to_read` set up in a test was raised."""
+    _injected_failures.clear()
+    yield
+    unfired = [injected for injected in _injected_failures if not injected.fired]
+    _injected_failures.clear()
+    assert not unfired, f'injected failures that did not fire: {unfired}'
 
 
 @pytest.fixture(autouse=True)
